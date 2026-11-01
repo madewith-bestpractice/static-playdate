@@ -143,7 +143,7 @@ static int ap_radio_only;
 static int ap_video, vid_phase, vid_n, vid_i;
 static char vid_ids[8][24];
 static uint32_t vid_t, vid_t0, vid_last_tick;
-static float ap_crank_change;
+static float ap_crank_change, vid_crank_total;
 static SDFile *vid_f;
 static void ap_save_screen(void) {
     uint8_t *fb = pd->graphics->getDisplayFrame();
@@ -615,6 +615,7 @@ static void video_step(void) {
     case 0:   /* wait for the first station's sound, then roll */
         if (playing_here && tick_ms() - player_playing_since() > 600) {
             vid_f = pd->file->open("vid_frames.bin", kFileWrite);
+            if (vid_f) pd->file->write(vid_f, "PDV2", 4);   /* records: u32 tick, f32 crank degrees, frame */
             audio_tap_begin(90);
             vid_t0 = vid_t = tick_ms();
             vid_phase = 1; vid_i = 0;
@@ -634,7 +635,7 @@ static void video_step(void) {
         float dt = (tick_ms() - vid_last_tick) / 1000.0f;
         vid_last_tick = tick_ms();
         float dir = target > dial ? 1.0f : -1.0f;
-        if (fabsf(target - dial) > 0.12f) ap_crank_change += dir * 190.0f * dt;   /* ~1.6 stations a second */
+        if (fabsf(target - dial) > 0.12f) { ap_crank_change += dir * 190.0f * dt; vid_crank_total += dir * 190.0f * dt; }   /* ~1.6 stations a second */
         else { vid_phase = 3; vid_t = tick_ms(); }
         break;
     }
@@ -665,6 +666,7 @@ static void video_capture(void) {
     if (!fb) return;
     uint32_t t = tick_ms();
     pd->file->write(vid_f, &t, 4);
+    pd->file->write(vid_f, &vid_crank_total, 4);
     pd->file->write(vid_f, fb, LCD_ROWSIZE * LCD_ROWS);
 }
 
