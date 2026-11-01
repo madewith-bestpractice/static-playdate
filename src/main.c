@@ -8,6 +8,7 @@
 #include "player.h"
 #include "report.h"
 #include "sched.h"
+#include "slots.h"
 #include "faces.h"
 #include "third_party/qrcodegen.h"
 #include <math.h>
@@ -265,6 +266,63 @@ static void schedule_tick(void) {
             sched_at = tick_ms() - 14u * 60 * 1000;     /* retry in a minute */
         }
         fetch_free(&sched_fetch);
+    }
+}
+
+/* ---------- bulletin slots ----------
+ * Bulletin breaks follow the board's slot list (slots.h), so this Playdate
+ * plays the same bulletin as every phone on the station. Fetched when the radio
+ * starts, every 10 minutes, and once ~120 s before the tuned station's next
+ * break (inside the 7 min lock window, so that answer is final). */
+static fetch_t slots_fetch;
+static int slots_fetching, slots_di, slots_nd, slots_due = 1;
+static char slots_dates[2][11];
+static slotlist_t *slots, *slots_building;
+static uint32_t slots_at, slots_applied_at;
+static int64_t slots_asked_for;
+
+static int slots_start_one(void) {
+    char url[96];
+    snprintf(url, sizeof url, SLOTS_URL "%s", slots_dates[slots_di]);
+    return fetch_start(&slots_fetch, url, "GET", NULL, 0, NULL, 512 * 1024) == 0;
+}
+
+static void slots_tick(void) {
+    if (net_state != 3 || !sched) return;
+    if (!slots_fetching && !sched_fetching && (slots_due || tick_ms() - slots_at > 10u * 60 * 1000)) {
+        slots_due = 0;
+        slots_at = tick_ms();
+        int64_t now = wall_ms();
+        slots_central_date(now, slots_dates[0]);                    /* today, Central */
+        slots_central_date(now + 3 * 3600 * 1000LL, slots_dates[1]); /* and tomorrow near midnight */
+        slots_nd = strcmp(slots_dates[0], slots_dates[1]) ? 2 : 1;
+        slots_di = 0;
+        slots_building = calloc(1, sizeof *slots_building);
+        if (slots_start_one()) slots_fetching = 1;
+        else { slots_free(slots_building); slots_building = NULL; }
+    }
+    if (slots_fetching && fetch_poll(&slots_fetch)) {
+        if (slots_fetch.done == 1 && slots_fetch.status == 200) {
+            char *text = slots_fetch.buf; slots_fetch.buf = NULL;
+            if (slots_add(slots_building, text)) LOG("slots: bad list for %s", slots_dates[slots_di]);
+        } else LOG("slots: fetch %s failed (HTTP %d)", slots_dates[slots_di], slots_fetch.status);
+        fetch_free(&slots_fetch);
+        if (!(++slots_di < slots_nd && slots_start_one())) {
+            slots_fetching = 0;
+            if (slots_building->nt) { slots_free(slots); slots = slots_building; slots_applied_at = 0; }
+            else { slots_free(slots_building); slots_at = tick_ms() - 9u * 60 * 1000; }   /* retry in a minute */
+            slots_building = NULL;
+        }
+    }
+    if (tick_ms() - slots_applied_at < 1000) return;
+    slots_applied_at = tick_ms();
+    int64_t now = wall_ms();
+    if (slots) slots_apply(sched, slots, now);
+    int st = player_station();
+    int64_t nb = st >= 0 ? slots_next_break_ms(sched, st, now) : -1;
+    if (nb > 0 && nb <= SLOTS_LEAD_MS) {
+        int64_t brk = (now + nb) / 10000;
+        if (brk != slots_asked_for) { slots_asked_for = brk; slots_due = 1; }
     }
 }
 
@@ -742,6 +800,7 @@ static int update(void *ud) {
         break;
     case SC_RADIO: {
         schedule_tick();
+        slots_tick();
         if (autopilot && !ap_done) {
             if (!ap_since || ap_since < 10) ap_since = tick_ms();
             if (ap_video) video_step();

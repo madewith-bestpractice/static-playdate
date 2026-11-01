@@ -19,7 +19,7 @@ HELIX = src/third_party/helix
 VPATH += src:$(HELIX):$(HELIX)/libhelix-mp3:$(HELIX)/libhelix-aac
 
 SRC = src/main.c src/net.c src/audio.c src/dec.c src/player.c src/bench.c src/report.c \
-      src/sched.c src/json.c src/mp3probe.c src/mp4.c src/syscalls.c src/textfold.c src/third_party/qrcodegen.c \
+      src/sched.c src/slots.c src/json.c src/mp3probe.c src/mp4.c src/syscalls.c src/textfold.c src/third_party/qrcodegen.c \
       $(HELIX)/helix_memory.c $(wildcard $(HELIX)/libhelix-mp3/*.c) $(wildcard $(HELIX)/libhelix-aac/*.c)
 UINCDIR = src $(HELIX) $(HELIX)/libhelix-mp3 $(HELIX)/libhelix-aac $(HELIX)/utils
 UASRC =
