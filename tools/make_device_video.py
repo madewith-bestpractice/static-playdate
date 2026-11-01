@@ -1,4 +1,5 @@
-"""Render a simulator take (autotest "video:...", PDV2 records with the crank
+"""(Vertical 1080x1920 cut for TikTok/Shorts: make_device_tiktok.py.)
+Render a simulator take (autotest "video:...", PDV2 records with the crank
 angle) as a stylized yellow handheld whose crank turns exactly as the take's
 crank did, with the recorded audio. No Panic logos or wordmarks are drawn.
 
