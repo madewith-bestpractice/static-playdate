@@ -1,0 +1,7 @@
+build/
+*.pdx/
+*.pdx.zip
+compile_flags.txt
+tools/out/
+.DS_Store
+Source/pdex.*

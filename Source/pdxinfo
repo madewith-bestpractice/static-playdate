@@ -1,0 +1,7 @@
+name=Static
+author=Best Practice
+description=Radio made of independent podcasts. Turn the crank to tune live stations. Preview build for testers.
+bundleID=com.bestpractice.static
+version=0.1.0
+buildNumber=1
+imagePath=launcher
