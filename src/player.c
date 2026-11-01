@@ -298,6 +298,7 @@ static int64_t drift;
 static uint32_t settled_at;
 static int warm_idx;
 static uint32_t listen_mark;
+static uint32_t playing_since;
 static int16_t pcm[8192];
 static uint8_t netbuf[8192];
 
@@ -306,6 +307,7 @@ int player_state(void) { return state; }
 const char *player_status(void) { return status; }
 int player_station(void) { return tuned; }
 int64_t player_drift_ms(void) { return drift; }
+uint32_t player_playing_since(void) { return playing_since; }
 
 static void set_status(const char *s) { snprintf(status, sizeof status, "%s", s); }
 
@@ -563,6 +565,7 @@ static void pump_stream(float budget_s) {
             if (now_off - play_head_ms > RESYNC_MS) { audio_flush(); play_head_ms = -1; return; }   /* too late: re-align */
             sub = S_PLAY;
             state = PL_PLAYING;
+            playing_since = tick_ms();
             set_status("");
             audio_hiss(0);
             audio_play(1);

@@ -15,6 +15,8 @@ static volatile int flush_req;
 static volatile uint32_t flush_to;
 static uint32_t rng = 0x12345678;
 static volatile int silent;          /* test runs: run everything, output zeros */
+static int16_t *tap;                 /* test runs: a copy of the output (video takes) */
+static volatile int tap_len, tap_cap;
 
 static int callback(void *ctx, int16_t *left, int16_t *right, int len) {
     (void)ctx; (void)right;
@@ -47,6 +49,10 @@ static int callback(void *ctx, int16_t *left, int16_t *right, int len) {
             v += (n * hz) >> 15;
         }
         left[i] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+    }
+    if (tap) {
+        int k = tap_cap - tap_len < len ? tap_cap - tap_len : len;
+        if (k > 0) { memcpy(tap + tap_len, left, (size_t)k * sizeof left[0]); tap_len += k; }
     }
     if (silent) memset(left, 0, (size_t)len * sizeof left[0]);
     tail = t;
@@ -101,3 +107,15 @@ int audio_underruns(void) { return underruns; }
 void audio_expect_gap(void) { expect_gap = 1; }
 uint32_t audio_played_samples(void) { return played; }
 void audio_test_silent(int on) { silent = on; }
+int audio_tap_begin(int seconds) {
+    tap_len = 0;
+    tap_cap = RATE * seconds;
+    tap = malloc((size_t)tap_cap * sizeof *tap);
+    return tap ? 0 : -1;
+}
+int16_t *audio_tap_end(int *len) {
+    int16_t *t = tap;
+    *len = tap_len;
+    tap = NULL;
+    return t;
+}

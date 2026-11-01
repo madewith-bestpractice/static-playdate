@@ -16,6 +16,7 @@ const char *player_status(void);            /* a short line for the screen, "" w
 const ep_t *player_episode(void);           /* live episode on the tuned station, or NULL */
 int player_station(void);
 int64_t player_drift_ms(void);              /* playback minus live (+ ahead) */
+uint32_t player_playing_since(void);        /* tick_ms when sound last started */
 
 /* Lifetime stats for the report. Formats: 0 MP3, 1 AAC-LC, 2 HE-AAC, 3 WAV. */
 typedef struct {

@@ -21,3 +21,7 @@ void audio_expect_gap(void);           /* end of an episode: a dry ring isn't an
 uint32_t audio_played_samples(void);
 /* Simulator test runs: the whole pipeline runs, the output is zeros. */
 void audio_test_silent(int on);
+/* Simulator video takes: copy everything the callback outputs (before the
+ * test silence) into memory; end returns it (caller frees). */
+int audio_tap_begin(int seconds);
+int16_t *audio_tap_end(int *len);

@@ -136,6 +136,15 @@ static uint32_t ap_since, ap_shot_at;
 static int ap_shot, ap_steps, ap_done;
 static uint32_t app_start;
 static int ap_radio_only;
+/* "video:<station>,<station>,...": a scripted take for a demo video. Starts on
+ * the first station, cranks to each next one, holds 3.5 s of sound on each,
+ * then shows the episode info; records every frame (Data/vid_frames.bin:
+ * u32 tick + 52x240 bytes) and the output audio (Data/vid_audio.raw). */
+static int ap_video, vid_phase, vid_n, vid_i;
+static char vid_ids[8][24];
+static uint32_t vid_t, vid_t0, vid_last_tick;
+static float ap_crank_change;
+static SDFile *vid_f;
 static void ap_save_screen(void) {
     uint8_t *fb = pd->graphics->getDisplayFrame();
     if (!fb || ap_shot >= 99) return;
@@ -525,7 +534,7 @@ static void draw_radio(void) {
     else if (st[0]) snprintf(line, sizeof line, "%s", st);
     else line[0] = 0;
     if (line[0]) { char f[96]; snprintf(f, sizeof f, "%s", line); text(f_small, f, 388 - text_w(f_small, f), 118); }
-    text_c(f_small, pd->system->isCrankDocked() ? "⬅️ Tune (or undock the crank)   Ⓐ Mute   Ⓑ Info" : "Crank to tune    Ⓐ Mute    Ⓑ Info", 200, 218);
+    text_c(f_small, (pd->system->isCrankDocked() && !autopilot) ? "⬅️ Tune (or undock the crank)   Ⓐ Mute   Ⓑ Info" : "Crank to tune    Ⓐ Mute    Ⓑ Info", 200, 218);
 }
 
 /* ---------- input ---------- */
@@ -535,6 +544,7 @@ static void radio_input(void) {
     PDButtons cur, pushed, rel;
     pd->system->getButtonState(&cur, &pushed, &rel);
     float change = pd->system->getCrankChange();
+    if (ap_video) { change += ap_crank_change; ap_crank_change = 0; }
     int n = sched->n;
     if (change != 0) {
         dial += change / 120.0f;               /* a third of a turn per station */
@@ -588,6 +598,75 @@ static void menu_rerun(void *ud) {
 }
 
 /* ---------- main loop ---------- */
+
+static void vid_log_episode(void) {
+    const ep_t *ep = player_episode();
+    int slot; int64_t off = 0;
+    if (sched && player_station() >= 0) sched_live(sched, player_station(), wall_ms(), &slot, &off);
+    LOG("video: t=%u ms on %s: %s | %s | at %lld s | %s", (unsigned)(tick_ms() - vid_t0),
+        sched && player_station() >= 0 ? sched->st[player_station()].id : "?",
+        ep ? ep->show : "", ep ? ep->title : "", (long long)(off / 1000), ep ? ep->url : "");
+}
+
+static void video_step(void) {
+    if (!sched) return;
+    int playing_here = player_state() == PL_PLAYING && selected == player_station();
+    switch (vid_phase) {
+    case 0:   /* wait for the first station's sound, then roll */
+        if (playing_here && tick_ms() - player_playing_since() > 600) {
+            vid_f = pd->file->open("vid_frames.bin", kFileWrite);
+            audio_tap_begin(90);
+            vid_t0 = vid_t = tick_ms();
+            vid_phase = 1; vid_i = 0;
+            LOG("video: rolling");
+            vid_log_episode();
+        }
+        break;
+    case 1:   /* hold on this station */
+        if (tick_ms() - vid_t > 3500) {
+            if (++vid_i < vid_n) { vid_phase = 2; vid_t = tick_ms(); vid_last_tick = tick_ms(); }
+            else { vid_phase = 4; vid_t = tick_ms(); view = 1; }
+        }
+        break;
+    case 2: { /* turn the crank toward the next station */
+        int target = station_index(vid_ids[vid_i]);
+        if (target < 0) { vid_phase = 4; vid_t = tick_ms(); view = 1; break; }
+        float dt = (tick_ms() - vid_last_tick) / 1000.0f;
+        vid_last_tick = tick_ms();
+        float dir = target > dial ? 1.0f : -1.0f;
+        if (fabsf(target - dial) > 0.12f) ap_crank_change += dir * 190.0f * dt;   /* ~1.6 stations a second */
+        else { vid_phase = 3; vid_t = tick_ms(); }
+        break;
+    }
+    case 3:   /* settled: wait for the sound, then hold */
+        if (playing_here) { vid_phase = 1; vid_t = tick_ms(); vid_log_episode(); }
+        else if (tick_ms() - vid_t > 15000) { LOG("video: no sound on %s", vid_ids[vid_i]); vid_phase = 1; vid_t = tick_ms(); }
+        break;
+    case 4:   /* the episode info, then cut */
+        if (tick_ms() - vid_t > 2800) {
+            if (vid_f) { pd->file->close(vid_f); vid_f = NULL; }
+            int n = 0;
+            int16_t *a = audio_tap_end(&n);
+            if (a) { data_write("vid_audio.raw", a, n * 2); free(a); }
+            char meta[64]; int ml = snprintf(meta, sizeof meta, "%u\n", (unsigned)vid_t0);
+            data_write("vid_meta.txt", meta, ml);
+            LOG("video: cut, %d audio samples", n);
+            view = 0;
+            vid_phase = 5;
+            ap_done = 1; report_stage("clean"); data_write("autotest_done", "1", 1);
+        }
+        break;
+    }
+}
+
+static void video_capture(void) {
+    if (!vid_f || vid_phase < 1 || vid_phase > 4) return;
+    uint8_t *fb = pd->graphics->getFrame();
+    if (!fb) return;
+    uint32_t t = tick_ms();
+    pd->file->write(vid_f, &t, 4);
+    pd->file->write(vid_f, fb, LCD_ROWSIZE * LCD_ROWS);
+}
 
 static uint32_t perf_at, perf_frames;
 static int64_t perf_bytes;
@@ -663,8 +742,9 @@ static int update(void *ud) {
         schedule_tick();
         if (autopilot && !ap_done) {
             if (!ap_since || ap_since < 10) ap_since = tick_ms();
-            if (ap_radio_only) view = (tick_ms() - ap_since > 22000 && tick_ms() - ap_since < 34000) ? 1 : 0;
-            if (sched && tick_ms() - ap_since > 40000) {
+            if (ap_video) video_step();
+            else if (ap_radio_only) view = (tick_ms() - ap_since > 22000 && tick_ms() - ap_since < 34000) ? 1 : 0;
+            if (!ap_video && sched && tick_ms() - ap_since > 40000) {
                 ap_since = tick_ms();
                 if (ap_radio_only) { ap_done = 1; report_stage("clean"); data_write("autotest_done", "1", 1); LOG("autopilot: done"); }
                 else if (ap_steps++ < sched->n) dial_target = (float)((selected + 1) % sched->n);
@@ -678,7 +758,8 @@ static int update(void *ud) {
         player_update(0.022f);
         uint32_t now = tick_ms();
         int animating = fabsf(dial - roundf(dial)) > 0.002f || dial_target >= 0 || player_state() == PL_TUNING || selected != player_station();
-        if (animating || now - last_draw > 500) { draw_radio(); last_draw = now; }
+        if (animating || now - last_draw > 500 || ap_video) { draw_radio(); last_draw = now; }
+        if (ap_video) video_capture();
         break;
     }
     }
@@ -715,7 +796,13 @@ int eventHandler(PlaydateAPI *playdate, PDSystemEvent event, uint32_t arg) {
         int len = 0;
         char *ap = data_read("autotest.txt", &len);
         autopilot = ap != NULL;
-        if (ap && !strncmp(ap, "radio:", 6)) {
+        if (ap && !strncmp(ap, "video:", 6)) {
+            ap_video = ap_radio_only = 1;
+            char *nl = strpbrk(ap, "\r\n"); if (nl) *nl = 0;
+            for (char *tok = strtok(ap + 6, ","); tok && vid_n < 8; tok = strtok(NULL, ","))
+                snprintf(vid_ids[vid_n++], sizeof vid_ids[0], "%s", tok);
+            if (vid_n) data_write("last.txt", vid_ids[0], (int)strlen(vid_ids[0]));
+        } else if (ap && !strncmp(ap, "radio:", 6)) {
             ap_radio_only = 1;
             char *nl = strpbrk(ap, "\r\n"); if (nl) *nl = 0;
             data_write("last.txt", ap + 6, (int)strlen(ap + 6));
