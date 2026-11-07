@@ -13,9 +13,9 @@ also listen in your browser and get the phone apps.
 it runs on real hardware. The app starts with a two-minute test that measures
 exactly that and, if you agree, sends us the numbers. Then the radio unlocks.
 
-Known issue: the 0.1.0 preview can crash while tuning. We've found two causes
-and the fixes are on the `fix/radio-crash` branch, not yet in a release or
-confirmed on a real Playdate. See
+0.1.1 fixes two crashes we found while tuning in the 0.1.0 preview. We've only
+confirmed that in the Simulator so far, so reports from real Playdates are very
+welcome. See
 [issue #1](https://github.com/madewith-bestpractice/static-playdate/issues/1).
 
 ## Install
