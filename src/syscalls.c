@@ -15,4 +15,19 @@ int _isatty(int f) { (void)f; return 1; }
 int _kill(int pid, int sig) { (void)pid; (void)sig; errno = EINVAL; return -1; }
 int _getpid(void) { return 1; }
 void _exit(int status) { (void)status; for (;;) {} }
+
+/* setup.c routes malloc to the system's allocator but not calloc, and newlib's
+ * _calloc_r reads its clear length from the word before the block: a header of
+ * newlib's own malloc, which isn't the one that made this block. */
+#include <reent.h>
+#include <stdlib.h>
+#include <string.h>
+void *_calloc_r(struct _reent *r, size_t n, size_t size) {
+    (void)r;
+    size_t total;
+    if (__builtin_mul_overflow(n, size, &total)) return NULL;
+    void *p = malloc(total);
+    if (p) memset(p, 0, total);
+    return p;
+}
 #endif

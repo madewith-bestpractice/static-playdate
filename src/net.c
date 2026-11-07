@@ -8,8 +8,15 @@
 #define STALL_MS 12000
 
 static const struct playdate_tcp *tcp;
-static struct { TCPConnection *c; uint32_t at; } grave[GRAVE_N];
-static int ngrave, nopen;
+/* tcp->open queues on one network thread and each connect blocks it, so an open
+ * can run many seconds after we gave up on its socket (a device takes 7-20 s to
+ * the first byte). Releasing a connection that an open or close still has to
+ * reach crashes inside the system, on a queued open or in on_open. So a socket
+ * we're done with waits here: for its own open to call back, then it's closed,
+ * and it's released only after a rest with no open in flight anywhere. */
+enum { G_OPENING, G_CLOSE, G_CLOSED };
+static struct { TCPConnection *c; uint32_t at; int st; } grave[GRAVE_N];
+static int ngrave, nopen, opening;
 static int64_t bytes_total;
 
 struct hs {
@@ -34,19 +41,23 @@ void net_init(void) { tcp = pd->network->tcp; }
 int net_open_count(void) { return nopen; }
 int64_t net_bytes_total(void) { return bytes_total; }
 
-static void bury(TCPConnection *c) {
+static void bury(TCPConnection *c, int open_pending) {
     if (!c) return;
     tcp->setUserdata(c, NULL);
-    tcp->close(c);
     nopen--;
-    if (ngrave < GRAVE_N) { grave[ngrave].c = c; grave[ngrave].at = tick_ms(); ngrave++; }
-    else tcp->release(c);
+    if (!open_pending) tcp->close(c);
+    if (ngrave == GRAVE_N) return;      /* never released: a small leak beats a crash */
+    grave[ngrave].c = c;
+    grave[ngrave].at = tick_ms();
+    grave[ngrave].st = open_pending ? G_OPENING : G_CLOSED;
+    ngrave++;
 }
 
 void net_tick(void) {
     int k = 0;
     for (int i = 0; i < ngrave; i++) {
-        if (tick_ms() - grave[i].at > RELEASE_AFTER_MS) tcp->release(grave[i].c);
+        if (grave[i].st == G_CLOSE) { tcp->close(grave[i].c); grave[i].st = G_CLOSED; grave[i].at = tick_ms(); }
+        if (grave[i].st == G_CLOSED && !opening && tick_ms() - grave[i].at > RELEASE_AFTER_MS) tcp->release(grave[i].c);
         else grave[k++] = grave[i];
     }
     ngrave = k;
@@ -104,14 +115,20 @@ int hs_header(const hs_t *h, const char *name, char *v, int cap) {
 static void fail(hs_t *h, const char *why) {
     if (h->st == HS_FAIL) return;
     snprintf(h->err, sizeof h->err, "%s", why);
-    bury(h->c); h->c = NULL;
+    bury(h->c, !h->opened); h->c = NULL;
     h->st = HS_FAIL;
 }
 
 static void on_open(TCPConnection *c, PDNetErr err, void *ud) {
-    hs_t *h = ud;
-    if (!h || h->c != c) return;
-    h->opened = 1; h->open_err = err;
+    (void)ud;                            /* the hs_t may be long gone: the userdata is cleared when it goes */
+    if (opening > 0) opening--;
+    hs_t *h = tcp->getUserdata(c);
+    if (h) {
+        if (h->c == c) { h->opened = 1; h->open_err = err; }
+        return;
+    }
+    for (int i = 0; i < ngrave; i++)
+        if (grave[i].c == c && grave[i].st == G_OPENING) grave[i].st = G_CLOSE;
 }
 static void on_closed(TCPConnection *c, PDNetErr err) {
     (void)err;
@@ -150,8 +167,15 @@ static int connect_hop(hs_t *h) {
     tcp->setReadTimeout(h->c, 20000);
     tcp->setReadBufferSize(h->c, 32 * 1024);
     tcp->setConnectionClosedCallback(h->c, on_closed);
-    PDNetErr e = tcp->open(h->c, on_open, h);
-    if (e != NET_OK) { char m[32]; snprintf(m, sizeof m, "open err %d", e); fail(h, m); return -1; }
+    opening++;
+    PDNetErr e = tcp->open(h->c, on_open, NULL);
+    if (e != NET_OK) {                   /* refused: no callback will come */
+        char m[32]; snprintf(m, sizeof m, "open err %d", e);
+        if (opening > 0) opening--;
+        h->opened = 1;
+        fail(h, m);
+        return -1;
+    }
     h->st = HS_CONNECT;
     return 0;
 }
@@ -176,7 +200,7 @@ hs_t *hs_open(const char *url, const char *method, int64_t from, int64_t to,
 
 void hs_close(hs_t *h) {
     if (!h) return;
-    bury(h->c);
+    bury(h->c, !h->opened);
     free(h->body);
     free(h);
 }
@@ -189,7 +213,7 @@ static void got_headers(hs_t *h, int hend) {
     if (h->status >= 300 && h->status < 400 && h->status != 304 && hs_header(h, "Location", v, sizeof v)) {
         static char next[4096];
         resolve(h->url, v, next, sizeof next);
-        bury(h->c); h->c = NULL;
+        bury(h->c, 0); h->c = NULL;
         if (++h->hops > MAX_HOPS) { fail(h, "too many redirects"); return; }
         if (!strncmp(h->url, "https://", 8) && !strncmp(next, "http://", 7)) {
             /* allowed (BBC/Triton ends on plain HTTP), just noted */
@@ -329,7 +353,7 @@ int hs_read(hs_t *h, void *buf, int cap) {
                 if (sz == 0) { h->chunk_phase = 3; }
                 else { h->chunk_left = sz; h->chunk_phase = 1; }
             } else if (h->chunk_phase == 2) h->chunk_phase = 0;
-            else if (h->chunk_phase == 3 && h->cl_len <= 1) { h->st = HS_DONE; bury(h->c); h->c = NULL; break; }
+            else if (h->chunk_phase == 3 && h->cl_len <= 1) { h->st = HS_DONE; bury(h->c, 0); h->c = NULL; break; }
             h->cl_len = 0;
         } else if (h->cl_len < (int)sizeof h->cl - 1) h->cl[h->cl_len++] = c;
     }

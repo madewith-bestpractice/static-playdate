@@ -243,7 +243,10 @@ int UnpackFrameHeader(MP3DecInfo *mp3DecInfo, unsigned char *buf)
 	fh->emphasis =   (buf[3] >> 0) & 0x03;
 
 	/* check parameters to avoid indexing tables with bad values */
-	if (fh->srIdx == 3 || fh->layer == 4 || fh->brIdx == 15)
+	/* Static: brIdx 0 (free format) is rejected too. No podcast uses it, and after a
+	 * seek a false sync that looks like it makes MP3Decode copy nSlots = -1 bytes, or a
+	 * "frame" far bigger than mainBuf. */
+	if (fh->srIdx == 3 || fh->layer == 4 || fh->brIdx == 15 || fh->brIdx == 0)
 		return -1;
 
 	fh->sfBand = &sfBandTable[fh->ver][fh->srIdx];	/* for readability (we reference sfBandTable many times in decoder) */
