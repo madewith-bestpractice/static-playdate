@@ -278,6 +278,9 @@ static int state = PL_OFF;
 static char status[64];
 static pj_t job, warm;
 static player_stats_t stats;
+/* This stream's decode speed. stats adds up the whole run, so judging a station
+ * by it would let one slow show mark every later one as too heavy. */
+static float stream_audio_s, stream_decode_s;
 
 typedef enum { S_IDLE, S_PROBE, S_CONNECT, S_ALIGN, S_PLAY, S_GAP, S_WAIT } sub_t;
 static sub_t sub;
@@ -397,6 +400,7 @@ static void start_stream(const probe_t *p) {
     if (!dec) { set_status("Decoder out of memory"); sub = S_WAIT; retry_at = tick_ms() + 5000; return; }
     dec_set_gain_db(dec, ep_gain);
     fmt_class = classify(p->fmt);
+    stream_audio_s = stream_decode_s = 0;
     stream = hs_open(p->final, "GET", byte, -1, NULL, 0, NULL);
     sub = S_CONNECT;
     play_head_ms = -1;
@@ -510,6 +514,8 @@ static void pump_stream(float budget_s) {
         if (dec_is_sbr(dec)) fmt_class = 2;
         stats.decode_s[fmt_class] += dt;
         stats.audio_s[fmt_class] += (float)n / RATE;
+        stream_decode_s += dt;
+        stream_audio_s += (float)n / RATE;
         if (n == 0) continue;
         stats.frames[fmt_class]++;
         if (chunk_ms + (int64_t)n * 1000 / RATE > audio_end_ms) n = (int)((audio_end_ms - chunk_ms) * RATE / 1000);
@@ -550,7 +556,7 @@ static void pump_stream(float budget_s) {
     }
 
     /* slower than real time: this Playdate can't keep up with this format */
-    if (sub == S_ALIGN && stats.audio_s[fmt_class] > 8 && stats.decode_s[fmt_class] > stats.audio_s[fmt_class] * 0.97f) {
+    if (sub == S_ALIGN && stream_audio_s > 8 && stream_decode_s > stream_audio_s * 0.97f) {
         stop_stream();
         stats.unsupported++;
         state = PL_UNSUPPORTED;
