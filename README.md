@@ -13,6 +13,11 @@ also listen in your browser and get the phone apps.
 it runs on real hardware. The app starts with a two-minute test that measures
 exactly that and, if you agree, sends us the numbers. Then the radio unlocks.
 
+Known issue: the 0.1.0 preview can crash while tuning. We've found two causes
+and the fixes are on the `fix/radio-crash` branch, not yet in a release or
+confirmed on a real Playdate. See
+[issue #1](https://github.com/madewith-bestpractice/static-playdate/issues/1).
+
 ## Install
 
 1. Download `Static-<version>.pdx.zip` from
@@ -107,6 +112,14 @@ Source map: `src/net.c` is HTTP/1.1 over the SDK's TLS sockets (the SDK's own
 HTTP layer follows redirects in the background and mixes up connections, so
 we don't use it), `src/player.c` tunes and keeps sync, `src/dec.c` wraps the
 decoders, `src/bench.c` is the test and `src/report.c` the reports.
+
+## Thanks
+
+We don't own a Playdate, so this port exists because of the people who do.
+Thanks to everyone who ran the test build and sent in their numbers, which is
+how we know where it stands on real hardware, and to
+[@ghalfacree](https://github.com/ghalfacree) for the first detailed report
+from a real device.
 
 ## License
 
