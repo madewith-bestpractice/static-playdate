@@ -13,7 +13,7 @@
 #include "mp4.h"
 #include "net.h"
 
-#define HEAD_BYTES 16384
+#define HEAD_BYTES 32768   /* the tag plus ~16 KB of frames, to measure the byte rate */
 #define MOOV_MAX (4 * 1024 * 1024)
 #define PC_N 32
 #define TARGET_MS 3000           /* keep this much decoded ahead */
@@ -216,12 +216,12 @@ static void pj_got(pj_t *j) {
         if (id3 > 8 * 1024 * 1024) { pj_fail(j, "huge tag"); return; }
         j->p.mp3.audio_start = id3;
         j->p.mp3.total = j->p.total > 0 ? j->p.total : 0;
-        if (id3 + 4096 <= len) {
+        if (id3 + 16384 <= len) {
             if (mp3_parse_first_frame(b + id3, (size_t)(len - id3), &j->p.mp3)) { j->p.fmt = FMT_MP3; pj_finish(j); }
             else pj_fail(j, "unknown format");
             return;
         }
-        pj_request(j, j->p.final, id3, 8192, PJ_ID3TAIL);
+        pj_request(j, j->p.final, id3, 16384, PJ_ID3TAIL);
         return;
     }
     if (j->st == PJ_ID3TAIL) {
