@@ -182,10 +182,13 @@ static void text_fit(LCDFont *f, const char *s, int x, int y, int w) {
 
 /* ---------- network bring-up ---------- */
 
+/* Each step logs a "net:" line, so a console or log.txt shows where it stops. */
+static uint32_t net_asked_at, net_wait_logged;
+
 static void on_access(bool allowed, void *ud) {
     (void)ud;
     net_state = allowed ? 3 : -2;
-    LOG("network access %s", allowed ? "allowed" : "denied");
+    LOG("net: access answer: %s", allowed ? "allowed" : "denied");
 }
 
 static void on_server_time(const char *t, const char *err) {
@@ -202,13 +205,15 @@ static void on_server_time(const char *t, const char *err) {
 }
 
 static void on_wifi(PDNetErr err) {
+    LOG("net: Wi-Fi callback: error %d, status %d, after %u ms", err, pd->network->getStatus(), (unsigned)(tick_ms() - net_asked_at));
     if (err != NET_OK) { net_state = -1; snprintf(net_msg, sizeof net_msg, "Wi-Fi didn't come up (error %d)", err); LOG("%s", net_msg); return; }
     net_state = 2;
+    LOG("net: requesting access");
     enum accessReply r = pd->network->tcp->requestAccess(NULL, 0, true,
         "Static streams podcast audio straight from each show's own host, so it needs to reach many servers.", on_access, NULL);
+    LOG("net: requestAccess returned %s", r == kAccessAllow ? "allow" : r == kAccessDeny ? "deny" : "ask");
     if (r == kAccessAllow) net_state = 3;
     else if (r == kAccessDeny) net_state = -2;
-    if (net_state == 3) LOG("network access already allowed");
 }
 
 static void net_bring_up(int then) {
@@ -216,7 +221,11 @@ static void net_bring_up(int then) {
     screen = SC_NET;
     net_state = 1;
     net_msg[0] = 0;
+    net_asked_at = tick_ms();
+    net_wait_logged = 0;
+    LOG("net: enabling Wi-Fi (status %d)", pd->network->getStatus());
     pd->network->setEnabled(true, on_wifi);
+    LOG("net: setEnabled returned");
 }
 
 /* ---------- schedule ---------- */
@@ -758,11 +767,16 @@ static int update(void *ud) {
         draw_intro();
         break;
     case SC_NET:
+        if (net_state > 0 && net_state < 3 && (tick_ms() - net_asked_at) / 10000 > net_wait_logged) {
+            net_wait_logged = (tick_ms() - net_asked_at) / 10000;
+            LOG("net: still %s after %u s", net_state == 1 ? "waiting for Wi-Fi" : "waiting for access", (unsigned)net_wait_logged * 10);
+        }
         if (net_state == 3) {
+            LOG("net: ready, starting the %s", after_net == SC_BENCH ? "test" : "radio");
             if (crash_note[0]) { report_send_crash(crash_note); crash_note[0] = 0; }
             if (after_net == SC_BENCH) begin_bench();
             else { pd->system->getServerTime(on_server_time); start_radio(); }
-        } else if (net_state < 0) screen = SC_NONET;
+        } else if (net_state < 0) { LOG("net: gave up (state %d)", net_state); screen = SC_NONET; }
         draw_net();
         break;
     case SC_NONET:

@@ -46,7 +46,11 @@ static void bury(TCPConnection *c, int open_pending) {
     tcp->setUserdata(c, NULL);
     nopen--;
     if (!open_pending) tcp->close(c);
-    if (ngrave == GRAVE_N) return;      /* never released: a small leak beats a crash */
+    if (ngrave == GRAVE_N) {            /* never released: a small leak beats a crash */
+        static int said;
+        if (!said) { said = 1; LOG("net: socket grave full (%d opens in flight), leaking sockets from here", opening); }
+        return;
+    }
     grave[ngrave].c = c;
     grave[ngrave].at = tick_ms();
     grave[ngrave].st = open_pending ? G_OPENING : G_CLOSED;
