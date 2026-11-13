@@ -16,17 +16,22 @@ int _kill(int pid, int sig) { (void)pid; (void)sig; errno = EINVAL; return -1; }
 int _getpid(void) { return 1; }
 void _exit(int status) { (void)status; for (;;) {} }
 
-/* setup.c routes malloc to the system's allocator but not calloc, and newlib's
- * _calloc_r reads its clear length from the word before the block: a header of
- * newlib's own malloc, which isn't the one that made this block. */
+/* calloc. setup.c routes _malloc_r/_realloc_r/_free_r to the system's
+ * allocator but not _calloc_r, and newlib's own _calloc_r takes its clear
+ * length from the word before the block (a header of newlib's malloc, not of
+ * the one that made the block). So this zeroes exactly what was asked for.
+ *
+ * It must call _malloc_r, never malloc: GCC turns malloc + memset(0) into
+ * calloc, and calloc calls _calloc_r, so 0.1.1 (which used malloc here) spun
+ * forever the first time anything called calloc, including printf's %f and
+ * strtod (newlib's _Balloc). `make dist` checks the binary for that loop. */
 #include <reent.h>
 #include <stdlib.h>
 #include <string.h>
 void *_calloc_r(struct _reent *r, size_t n, size_t size) {
-    (void)r;
     size_t total;
-    if (__builtin_mul_overflow(n, size, &total)) return NULL;
-    void *p = malloc(total);
+    if (__builtin_mul_overflow(n, size, &total)) { r->_errno = ENOMEM; return NULL; }
+    void *p = _malloc_r(r, total);
     if (p) memset(p, 0, total);
     return p;
 }
