@@ -10,7 +10,7 @@
 extern PlaydateAPI *pd;
 
 #ifndef APP_VERSION
-#define APP_VERSION "0.1.1"
+#define APP_VERSION "0.1.2"
 #endif
 #define USER_AGENT "StaticRadio/playdate-preview (+https://staticradio.app)"
 #define SCHEDULE_URL "https://data.staticradio.app/schedule-wear.json"

@@ -13,9 +13,11 @@ also listen in your browser and get the phone apps.
 it runs on real hardware. The app starts with a two-minute test that measures
 exactly that and, if you agree, sends us the numbers. Then the radio unlocks.
 
-0.1.1 fixes two crashes we found while tuning in the 0.1.0 preview. We've only
-confirmed that in the Simulator so far, so reports from real Playdates are very
-welcome. See
+0.1.2 fixes a freeze in 0.1.1: on a real Playdate it stopped on "Turning on
+Wi-Fi…" and crashed about a minute later (error e0). Please skip 0.1.1. 0.1.2
+keeps 0.1.1's fixes for two crashes while tuning in 0.1.0. We still don't own
+a Playdate, so we've only checked this in the Simulator and in the built code,
+and reports from real Playdates are very welcome. See
 [issue #1](https://github.com/madewith-bestpractice/static-playdate/issues/1).
 
 ## Install
