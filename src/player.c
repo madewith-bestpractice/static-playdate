@@ -20,6 +20,9 @@
 #define PREROLL_MS 500
 #define RESYNC_MS 400            /* drift beyond this is corrected */
 #define WARM_AHEAD_S 45          /* resolve the next episode this early */
+#define WARM_REST_MS 30000       /* after a failed background probe, leave the network alone this long */
+#define GIVE_UP_FAILS 6          /* then stop saying "reconnecting" and retry once a minute */
+#define GIVE_UP_RETRY_MS 60000
 
 /* ---------- probe cache ---------- */
 
@@ -85,6 +88,7 @@ typedef struct {
     probe_t p;
     int64_t box_at; int nbox;
     uint32_t t0;
+    int prio;
     char err[64];
 } pj_t;
 
@@ -106,6 +110,7 @@ static int pj_request(pj_t *j, const char *url, int64_t from, int64_t len, int n
     if (j->h) hs_close(j->h);
     j->h = hs_open(url, "GET", from, from + len - 1, NULL, 0, NULL);
     if (!j->h) { pj_fail(j, "no memory"); return -1; }
+    hs_set_priority(j->h, j->prio);
     if ((int64_t)j->cap < len) {
         uint8_t *nb = realloc(j->buf, (size_t)len);
         if (!nb) { pj_fail(j, "no memory"); return -1; }
@@ -116,8 +121,9 @@ static int pj_request(pj_t *j, const char *url, int64_t from, int64_t len, int n
     return 0;
 }
 
-static void pj_start(pj_t *j, const char *orig, int want_moov) {
+static void pj_start(pj_t *j, const char *orig, int want_moov, int prio) {
     pj_reset(j);
+    j->prio = prio;
     snprintf(j->orig, sizeof j->orig, "%s", orig);
     j->want_moov = want_moov;
     j->t0 = tick_ms();
@@ -300,6 +306,7 @@ static uint32_t ttfb_avg = 900;
 static int64_t drift;
 static uint32_t settled_at;
 static int warm_idx;
+static uint32_t warm_rest_until;
 static uint32_t listen_mark;
 static uint32_t playing_since;
 static int16_t pcm[8192];
@@ -402,6 +409,7 @@ static void start_stream(const probe_t *p) {
     fmt_class = classify(p->fmt);
     stream_audio_s = stream_decode_s = 0;
     stream = hs_open(p->final, "GET", byte, -1, NULL, 0, NULL);
+    hs_set_priority(stream, NET_PRIO_HIGH);
     sub = S_CONNECT;
     play_head_ms = -1;
 }
@@ -419,7 +427,7 @@ static void begin_episode(void) {
     if (off >= audio_end_ms) { sub = S_GAP; return; }       /* in the gap / past a bulletin's cap */
     probe_t *p = cache_find(ep_url);
     if (p && (p->fmt != FMT_MP4 || (moov_cache.ok && moov_cache.key == hash(ep_url)))) { start_stream(p); return; }
-    pj_start(&job, ep_url, 1);
+    pj_start(&job, ep_url, 1, NET_PRIO_HIGH);
     sub = S_PROBE;
     if (state != PL_PLAYING) set_status("Finding the episode");
 }
@@ -428,6 +436,14 @@ static void trouble(const char *why, uint32_t retry_ms) {
     stop_stream();
     pj_reset(&job);
     fails++;
+    if (fails > GIVE_UP_FAILS) {
+        /* Don't loop "reconnecting" forever: say so plainly, keep trying slowly.
+         * Turning the dial away and back tries again straight away. */
+        char n[160]; net_describe(n, sizeof n);
+        if (fails == GIVE_UP_FAILS + 1) LOG("player: %d tries failed (%s); now retrying once a minute (%s)", GIVE_UP_FAILS, why, n);
+        why = net_stuck() ? "The network stopped answering. Retrying" : "Can't reach this show. Trying again soon";
+        retry_ms = GIVE_UP_RETRY_MS;
+    }
     set_status(why);
     state = PL_TROUBLE;
     sub = S_WAIT;
@@ -448,6 +464,20 @@ static int align_chunk(int n, int64_t live_ms, int64_t *chunk_ms) {
     return n - drop;
 }
 
+/* The stream broke: reconnect with a growing pause (1.5, 3, 6, 12, 20 s).
+ * From the second failure in a row, look the link up again from the feed's
+ * URL, in case the redirect we cached went stale. */
+static void stream_lost(const char *why, int http) {
+    char n[160]; net_describe(n, sizeof n);
+    stats.stream_fail++;
+    LOG("stream failed: %s (HTTP %d), try %d; %s", why, http, fails + 1, n);
+    probe_t *p = cache_find(ep_url);
+    if (fails >= 1 && p && p->fmt != FMT_MP4) cache_drop(ep_url);   /* an MP4 keeps its index */
+    uint32_t wait = 1500u << (fails < 4 ? fails : 4);
+    if (wait > 20000) wait = 20000;
+    trouble("Lost the stream, reconnecting", wait);
+}
+
 static void pump_stream(float budget_s) {
     /* network -> decoder input */
     if (stream && dec) {
@@ -456,9 +486,7 @@ static void pump_stream(float budget_s) {
         if (s == HS_FAIL) {
             int st = hs_status(stream);
             if (st == 403 || st == 404 || st == 410) cache_drop(ep_url);   /* stale signed link */
-            stats.stream_fail++;
-            LOG("stream failed: %s (HTTP %d)", hs_error(stream), st);
-            trouble("Lost the stream, reconnecting", 1500);
+            stream_lost(hs_error(stream), st);
             return;
         }
         if (s == HS_BODY || s == HS_DONE) {
@@ -485,7 +513,7 @@ static void pump_stream(float budget_s) {
                     continue;
                 }
                 if (n == -1) { dec_end_input(dec); break; }
-                if (n == -2) { stats.stream_fail++; trouble("Lost the stream, reconnecting", 1500); return; }
+                if (n == -2) { stream_lost(hs_error(stream), hs_status(stream)); return; }
                 break;
             }
         }
@@ -595,9 +623,14 @@ static void pump_stream(float budget_s) {
 static void maybe_warm(void) {
     /* one background probe at a time, only while playback is comfortable */
     if (warm.st != PJ_IDLE) {
-        if (pj_poll(&warm)) pj_reset(&warm);
+        if (pj_poll(&warm)) {
+            /* a host that doesn't answer ties up the network for everyone */
+            if (warm.st == PJ_FAIL) warm_rest_until = tick_ms() + WARM_REST_MS;
+            pj_reset(&warm);
+        }
         return;
     }
+    if ((int32_t)(tick_ms() - warm_rest_until) < 0) return;
     if (sub != S_PLAY || audio_buffered() < RATE * 2 || job.st != PJ_IDLE) return;
     if (!sch || tuned < 0) return;
     int64_t now = wall_ms();
@@ -608,7 +641,7 @@ static void maybe_warm(void) {
         if (rem < WARM_AHEAD_S * 1000) {
             const station_t *s = &sch->st[tuned];
             const ep_t *next = &s->eps[(slot + 1) % s->n];
-            if (!cache_find(next->url)) { pj_start(&warm, next->url, 0); return; }
+            if (!cache_find(next->url)) { pj_start(&warm, next->url, 0, NET_PRIO_LOW); return; }
         }
     }
     /* the neighbors' live episodes, after 10 s on this station */
@@ -618,7 +651,7 @@ static void maybe_warm(void) {
         int st = tuned + order[warm_idx++];
         if (st < 0 || st >= sch->n) continue;
         const ep_t *ep = live(st, NULL, NULL);
-        if (ep && !cache_find(ep->url)) { pj_start(&warm, ep->url, 0); return; }
+        if (ep && !cache_find(ep->url)) { pj_start(&warm, ep->url, 0, NET_PRIO_LOW); return; }
     }
 }
 

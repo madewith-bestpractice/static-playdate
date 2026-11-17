@@ -72,6 +72,18 @@ While you listen, Static counts you on the station's listener count the same
 way the phone apps do (a heartbeat with the same random ID), so other
 listeners can see you there.
 
+### If it crashes or gets stuck
+
+Reboot to the Data Disk (**Settings > System > Reboot to Data Disk**) and
+attach these to [issue #1](https://github.com/madewith-bestpractice/static-playdate/issues/1):
+
+- Static's own log, `log.txt`, in its data folder. If you sideloaded Static
+  (the usual way), that's `Data/user.<your user ID>.com.bestpractice.static/log.txt`,
+  where the user ID is a number. Otherwise it's `Data/com.bestpractice.static/log.txt`.
+- `crashlog.txt` and `errorlog.txt` at the top of the disk, if they have
+  entries from that day. A freeze that ends in "You need to restart your
+  Playdate" is usually only in `errorlog.txt`.
+
 ## Use
 
 - **Turn the crank** to tune (a third of a turn per station), or press
