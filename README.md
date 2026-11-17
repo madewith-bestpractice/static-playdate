@@ -13,11 +13,12 @@ also listen in your browser and get the phone apps.
 it runs on real hardware. The app starts with a two-minute test that measures
 exactly that and, if you agree, sends us the numbers. Then the radio unlocks.
 
-0.1.2 fixes a freeze in 0.1.1: on a real Playdate it stopped on "Turning on
-Wi-Fi…" and crashed about a minute later (error e0). Please skip 0.1.1. 0.1.2
-keeps 0.1.1's fixes for two crashes while tuning in 0.1.0. We still don't own
-a Playdate, so we've only checked this in the Simulator and in the built code,
-and reports from real Playdates are very welcome. See
+0.1.3 stops a stuck network from piling up connections: in 0.1.2 a dropped
+stream could loop on "Lost the stream, reconnecting", and quick retuning could
+freeze the Playdate (error e1). Static now asks for one connection at a time,
+backs off between retries and says plainly when it can't reach a show. We still
+don't own a Playdate, so we've only checked this in the Simulator, and reports
+from real Playdates are very welcome. See
 [issue #1](https://github.com/madewith-bestpractice/static-playdate/issues/1).
 
 ## Install
