@@ -137,6 +137,13 @@ static uint32_t ap_since, ap_shot_at;
 static int ap_shot, ap_steps, ap_done;
 static uint32_t app_start;
 static int ap_radio_only;
+/* "retune:<station>[,slow|,hang]": the rapid-retune test from issue #1. Waits
+ * for sound, then steps to the next station every 2 s, 20 times, then holds
+ * the last one for 3 minutes. ",slow" makes every open answer after 6 s (like
+ * a device); ",hang" also makes the 5th open never answer; ",outage" skips
+ * the retunes, drops the stream after 400 KB and fails every open for 150 s. */
+static int ap_retune, ap_rt_phase, ap_rt_steps, ap_rt_long;
+static uint32_t ap_rt_at;
 /* "video:<station>,<station>,...": a scripted take for a demo video. Starts on
  * the first station, cranks to each next one, holds 3.5 s of sound on each,
  * then shows the episode info; records every frame (Data/vid_frames.bin:
@@ -745,16 +752,58 @@ static uint32_t perf_at, perf_frames;
 static int64_t perf_bytes;
 float app_fps = 0;
 
+static void retune_step(void) {
+    if (!sched) return;
+    uint32_t now = tick_ms();
+    switch (ap_rt_phase) {
+    case 0:   /* wait for sound on the first station (or a minute) */
+        if (!ap_rt_at) ap_rt_at = now;
+        if (player_state() == PL_PLAYING || now - ap_rt_at > 60000) {
+            LOG("autopilot: retune test starts (state %d)", player_state());
+            ap_rt_phase = 1; ap_rt_at = now;
+        }
+        break;
+    case 1:   /* next station every 2 s */
+        if (now - ap_rt_at >= 2000) {
+            ap_rt_at = now;
+            if (ap_rt_steps++ < 20) {
+                dial_target = (float)((selected + 1) % sched->n);
+                LOG("autopilot: retune %d to %s", ap_rt_steps, sched->st[(selected + 1) % sched->n].id);
+            } else { ap_rt_phase = 2; LOG("autopilot: holding on %s", sched->st[selected].id); }
+        }
+        break;
+    case 2:   /* hold for 3 minutes (5 for the outage test) */
+        if (now - ap_rt_at > (ap_rt_long ? 330000u : 180000u)) {
+            const player_stats_t *s = player_stats();
+            LOG("autopilot: done; listened %u s, %d tunes, %d first sounds, %d stream failures, %d reconnects, state %d",
+                (unsigned)s->listen_s, s->tunes, s->tune_ok, s->stream_fail, s->reconnects, player_state());
+            ap_done = 1; report_stage("clean"); data_write("autotest_done", "1", 1);
+        }
+        break;
+    }
+}
+
+static uint32_t frame_max_ms;
+
 static int update(void *ud) {
     (void)ud;
+    /* how long the last update took, start to start, for the perf line */
+    static uint32_t frame_at;
+    uint32_t fnow = tick_ms();
+    if (frame_at && fnow - frame_at > frame_max_ms) frame_max_ms = fnow - frame_at;
+    if (frame_at && fnow - frame_at > 2000) LOG("slow frame: %u ms since the last update", (unsigned)(fnow - frame_at));
+    frame_at = fnow;
     pd->system->resetElapsedTime();
     perf_frames++;
     if (tick_ms() - perf_at >= 10000) {
         uint32_t ms = tick_ms() - perf_at;
         int64_t b = net_bytes_total();
         if (perf_at) app_fps = perf_frames * 1000.0f / ms;
-        if (perf_at) LOG("perf: %.1f fps, network %.0f KB/s, buffer %d ms, player %d",
-                         perf_frames * 1000.0 / ms, (b - perf_bytes) / 1.024 / ms, audio_buffered() * 1000 / RATE, player_state());
+        char nd[160]; net_describe(nd, sizeof nd);
+        if (perf_at) LOG("perf: %.1f fps, network %.0f KB/s, buffer %d ms, player %d, slowest frame %u ms; %s",
+                         perf_frames * 1000.0 / ms, (b - perf_bytes) / 1.024 / ms, audio_buffered() * 1000 / RATE, player_state(),
+                         (unsigned)frame_max_ms, nd);
+        frame_max_ms = 0;
         perf_at = tick_ms(); perf_frames = 0; perf_bytes = b;
     }
     net_tick();
@@ -822,8 +871,9 @@ static int update(void *ud) {
         if (autopilot && !ap_done) {
             if (!ap_since || ap_since < 10) ap_since = tick_ms();
             if (ap_video) video_step();
+            else if (ap_retune) retune_step();
             else if (ap_radio_only) view = (tick_ms() - ap_since > 22000 && tick_ms() - ap_since < 34000) ? 1 : 0;
-            if (!ap_video && sched && tick_ms() - ap_since > 40000) {
+            if (!ap_video && !ap_retune && sched && tick_ms() - ap_since > 40000) {
                 ap_since = tick_ms();
                 if (ap_radio_only) { ap_done = 1; report_stage("clean"); data_write("autotest_done", "1", 1); LOG("autopilot: done"); }
                 else if (ap_steps++ < sched->n) dial_target = (float)((selected + 1) % sched->n);
@@ -885,6 +935,15 @@ int eventHandler(PlaydateAPI *playdate, PDSystemEvent event, uint32_t arg) {
             ap_radio_only = 1;
             char *nl = strpbrk(ap, "\r\n"); if (nl) *nl = 0;
             data_write("last.txt", ap + 6, (int)strlen(ap + 6));
+        } else if (ap && !strncmp(ap, "retune:", 7)) {
+            ap_radio_only = ap_retune = 1;
+            char *nl = strpbrk(ap, "\r\n"); if (nl) *nl = 0;
+            char *opt = strchr(ap + 7, ',');
+            if (opt) *opt++ = 0;
+            data_write("last.txt", ap + 7, (int)strlen(ap + 7));
+            if (opt && !strcmp(opt, "slow")) net_debug(6000, 0);
+            if (opt && !strcmp(opt, "hang")) net_debug(6000, 5);
+            if (opt && !strcmp(opt, "outage")) { net_debug(6000, 0); net_debug_outage(400 * 1024, 150000); ap_rt_steps = 20; ap_rt_long = 1; }
         }
         free(ap);
         if (autopilot) { LOG("autopilot on"); audio_test_silent(1); }
