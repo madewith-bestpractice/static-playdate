@@ -53,7 +53,17 @@ void report_init(void) {
     free(st);
 }
 
-void report_stage(const char *stage) { data_write("stage.txt", stage, (int)strlen(stage)); }
+static char stage_now[48];
+void report_stage(const char *stage) {
+    snprintf(stage_now, sizeof stage_now, "%s", stage);
+    data_write("stage.txt", stage, (int)strlen(stage));
+}
+void report_locked(int locked) {
+    if (!stage_now[0] || !strcmp(stage_now, "clean")) return;
+    char s[64];
+    int n = snprintf(s, sizeof s, locked ? "%s|locked" : "%s", stage_now);
+    data_write("stage.txt", s, n < (int)sizeof s ? n : (int)sizeof s - 1);
+}
 void report_clean_exit(void) { report_stage("clean"); }
 const char *report_last_crash(void) { return have_crash ? crash_stage : NULL; }
 int report_status(void) { return rstatus; }

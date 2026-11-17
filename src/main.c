@@ -208,6 +208,7 @@ static void on_wifi(PDNetErr err) {
     LOG("net: Wi-Fi callback: error %d, status %d, after %u ms", err, pd->network->getStatus(), (unsigned)(tick_ms() - net_asked_at));
     if (err != NET_OK) { net_state = -1; snprintf(net_msg, sizeof net_msg, "Wi-Fi didn't come up (error %d)", err); LOG("%s", net_msg); return; }
     net_state = 2;
+    report_stage("net:access");
     LOG("net: requesting access");
     enum accessReply r = pd->network->tcp->requestAccess(NULL, 0, true,
         "Static streams podcast audio straight from each show's own host, so it needs to reach many servers.", on_access, NULL);
@@ -223,6 +224,9 @@ static void net_bring_up(int then) {
     net_msg[0] = 0;
     net_asked_at = tick_ms();
     net_wait_logged = 0;
+    /* Its own breadcrumb, not "intro": a run that stops while Wi-Fi comes up
+     * (or while waiting for network access) reports as net:wifi / net:access. */
+    report_stage("net:wifi");
     LOG("net: enabling Wi-Fi (status %d)", pd->network->getStatus());
     pd->network->setEnabled(true, on_wifi);
     LOG("net: setEnabled returned");
@@ -776,7 +780,7 @@ static int update(void *ud) {
             if (crash_note[0]) { report_send_crash(crash_note); crash_note[0] = 0; }
             if (after_net == SC_BENCH) begin_bench();
             else { pd->system->getServerTime(on_server_time); start_radio(); }
-        } else if (net_state < 0) { LOG("net: gave up (state %d)", net_state); screen = SC_NONET; }
+        } else if (net_state < 0) { LOG("net: gave up (state %d)", net_state); report_stage("nonet"); screen = SC_NONET; }
         draw_net();
         break;
     case SC_NONET:
@@ -900,9 +904,11 @@ int eventHandler(PlaydateAPI *playdate, PDSystemEvent event, uint32_t arg) {
         if (log_file) { pd->file->close(log_file); log_file = NULL; }
         break;
     case kEventLock:
+        report_locked(1);
         LOG("locked");
         break;
     case kEventUnlock:
+        report_locked(0);
         LOG("unlocked");
         break;
     default:
