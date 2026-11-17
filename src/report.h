@@ -11,6 +11,9 @@ const char *report_device_id(void);
  * report_clean_exit() on a normal exit. */
 void report_stage(const char *stage);
 void report_clean_exit(void);
+/* While the device is locked the breadcrumb reads "<step>|locked", so a run
+ * that ended asleep (battery, power off) isn't read as a crash on that step. */
+void report_locked(int locked);
 /* The previous run's last step if it didn't exit cleanly, else NULL. */
 const char *report_last_crash(void);
 
