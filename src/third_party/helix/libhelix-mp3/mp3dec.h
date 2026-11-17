@@ -125,6 +125,13 @@ void MP3GetLastFrameInfo(HMP3Decoder hMP3Decoder, MP3FrameInfo *mp3FrameInfo);
 int MP3GetNextFrameInfo(HMP3Decoder hMP3Decoder, MP3FrameInfo *mp3FrameInfo, unsigned char *buf);
 int MP3FindSyncWord(unsigned char *buf, int nBytes);
 
+/* Static for Playdate: mono output. Stereo is mixed before the synthesis
+ * filterbank, which halves its work. halfRate also drops subbands 16-31 and
+ * synthesizes every other sample, so the output is at half the sample rate
+ * and stops at a quarter of it (about 11 kHz for a 44.1 kHz file). Can be
+ * switched on between frames; MP3GetLastFrameInfo then describes the output. */
+void MP3SetMonoOutput(HMP3Decoder hMP3Decoder, int halfRate);
+
 #ifdef __cplusplus
 }
 #endif

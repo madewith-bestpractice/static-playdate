@@ -117,8 +117,8 @@ static char net_msg[96];
 static int bench_done_before;
 static int report_choice_made;
 
-/* dial */
-static float dial = 0;           /* in stations */
+/* dial: it loops, so past the last station comes the first */
+static float dial = 0;           /* in stations, kept within [-0.5, n - 0.5) */
 static float dial_target = -1;   /* d-pad animation target, -1 none */
 static uint32_t crank_idle_at;
 static int selected = -1;
@@ -137,6 +137,10 @@ static uint32_t ap_since, ap_shot_at;
 static int ap_shot, ap_steps, ap_done;
 static uint32_t app_start;
 static int ap_radio_only;
+/* "radio:<station>[,hold=<minutes>][,slow=<factor>]": plays that station for
+ * 40 s (or the given minutes), with decoding made <factor> times slower to
+ * act like a slower Playdate (player_debug_slow_decode). */
+static uint32_t ap_hold_ms = 40000;
 /* "retune:<station>[,slow|,hang]": the rapid-retune test from issue #1. Waits
  * for sound, then steps to the next station every 2 s, 20 times, then holds
  * the last one for 3 minutes. ",slow" makes every open answer after 6 s (like
@@ -144,6 +148,12 @@ static int ap_radio_only;
  * the retunes, drops the stream after 400 KB and fails every open for 150 s. */
 static int ap_retune, ap_rt_phase, ap_rt_steps, ap_rt_long;
 static uint32_t ap_rt_at;
+/* "seam:<station>": the dial's loop. Starting on the last station, cranks
+ * slowly forward across the seam, quickly back across it, then steps across
+ * it with the d-pad both ways, holding between moves; logs each tune and
+ * saves the screen every 250 ms while the dial moves. */
+static int ap_seam, ap_seam_i;
+static uint32_t ap_seam_at, ap_seam_last;
 /* "video:<station>,<station>,...": a scripted take for a demo video. Starts on
  * the first station, cranks to each next one, holds 3.5 s of sound on each,
  * then shows the episode info; records every frame (Data/vid_frames.bin:
@@ -539,10 +549,10 @@ static void draw_radio(void) {
     const int y0 = 32, y1 = 104, spacing = 150;
     pd->graphics->fillRect(0, y0, 400, y1 - y0, kColorBlack);
     pd->graphics->setDrawMode(kDrawModeFillWhite);
-    for (int i = 0; i < sched->n; i++) {
+    for (int i = -sched->n; i < 2 * sched->n; i++) {   /* the loop's neighbours across the seam too */
         float x = 200 + ((float)i - dial) * spacing;
         if (x < -120 || x > 520) continue;
-        text_c(f_big, sched->st[i].tag, (int)x, 52);
+        text_c(f_big, sched->st[(i + sched->n) % sched->n].tag, (int)x, 52);
     }
     pd->graphics->setDrawMode(kDrawModeCopy);
     for (int k = -30; k <= 30; k++) {           /* ticks every tenth of a station */
@@ -550,7 +560,6 @@ static void draw_radio(void) {
         int x = (int)(200 + (pos - dial) * spacing);
         if (x < 0 || x >= 400) continue;
         int major = fabsf(pos - roundf(pos)) < 0.01f;
-        if (pos < -0.01f || pos > sched->n - 1 + 0.01f) continue;
         pd->graphics->drawLine(x, y1 - (major ? 12 : 5), x, y1 - 1, 1, kColorWhite);
     }
     pd->graphics->fillRect(199, y0, 3, y1 - y0, kColorWhite);   /* needle */
@@ -592,7 +601,8 @@ static void draw_radio(void) {
         text(f_small, l, 12, y); y += 18;
         snprintf(l, sizeof l, "Tunes %d, %.1f s avg to sound, %d failed", s->tunes, s->tune_ok ? s->tune_ms_sum / (double)s->tune_ok / 1000.0 : 0.0, s->tune_fail);
         text(f_small, l, 12, y); y += 18;
-        snprintf(l, sizeof l, "Listened %u min  resyncs %d  %.0f fps", (unsigned)(s->listen_s / 60), s->resyncs, (double)app_fps);
+        snprintf(l, sizeof l, "Listened %u min  resyncs %d  %.0f fps%s", (unsigned)(s->listen_s / 60), s->resyncs, (double)app_fps,
+                 player_lite() ? "  lite" : "");
         text(f_small, l, 12, y); y += 18;
         snprintf(l, sizeof l, "ID %s  v" APP_VERSION "   Ⓑ Back", report_device_id());
         text(f_small, l, 12, y);
@@ -617,42 +627,50 @@ static void draw_radio(void) {
 
 /* ---------- input ---------- */
 
+/* The same dial position, moved into [-0.5, n - 0.5) */
+static float wrap_dial(float d, int n) {
+    while (d >= n - 0.5f) d -= n;
+    while (d < -0.5f) d += n;
+    return d;
+}
+
+/* D-pad: glide one station along, across the seam if need be. The glide
+ * starts from the same position one loop over, so it moves the short way. */
+static void dial_step(int dir) {
+    int n = sched->n;
+    int to = (int)roundf(dial_target >= 0 ? dial_target : dial) + dir;
+    if (to < 0) { to += n; dial += n; }
+    if (to >= n) { to -= n; dial -= n; }
+    dial_target = (float)to;
+}
+
 static void radio_input(void) {
-    if (!sched) return;
+    if (!sched || sched->n <= 0) return;
     PDButtons cur, pushed, rel;
     pd->system->getButtonState(&cur, &pushed, &rel);
     float change = pd->system->getCrankChange();
-    if (ap_video) { change += ap_crank_change; ap_crank_change = 0; }
+    if (autopilot) { change = ap_crank_change; ap_crank_change = 0; }   /* the script's crank only */
     int n = sched->n;
     if (change != 0) {
         dial += change / 120.0f;               /* a third of a turn per station */
         dial_target = -1;
         crank_idle_at = tick_ms();
     }
-    if (pushed & (kButtonRight | kButtonLeft)) {
-        int base = (int)roundf(dial_target >= 0 ? dial_target : dial);
-        base += (pushed & kButtonRight) ? 1 : -1;
-        if (base < 0) base = 0;
-        if (base > n - 1) base = n - 1;
-        dial_target = (float)base;
-    }
-    if (dial < -0.4f) dial = -0.4f;
-    if (dial > n - 1 + 0.4f) dial = n - 1 + 0.4f;
+    if (pushed & kButtonRight) dial_step(1);
+    if (pushed & kButtonLeft) dial_step(-1);
+    if (dial_target < 0) dial = wrap_dial(dial, n);   /* (a glide wraps once it lands) */
     if (dial_target >= 0) {                    /* d-pad: glide */
         dial += (dial_target - dial) * 0.35f;
         if (fabsf(dial_target - dial) < 0.01f) { dial = dial_target; dial_target = -1; }
     } else if (tick_ms() - crank_idle_at > 180) {   /* crank at rest: settle into the detent */
         float r = roundf(dial);
-        if (r < 0) r = 0;
-        if (r > n - 1) r = (float)(n - 1);
         dial += (r - dial) * 0.3f;
         if (fabsf(r - dial) < 0.005f) dial = r;
     }
-    int near = (int)roundf(dial);
-    if (near < 0) near = 0;
-    if (near > n - 1) near = n - 1;
+    int near = ((int)roundf(dial) % n + n) % n;
     if (near != selected) { selected = near; selected_at = tick_ms(); }
-    if (selected != player_station() && tick_ms() - selected_at > 300 && fabsf(dial - selected) < 0.15f) {
+    if (selected != player_station() && tick_ms() - selected_at > 300 && fabsf(dial - roundf(dial)) < 0.15f) {
+        LOG("tune: %s", sched->st[selected].id);
         player_tune(selected);
         data_write("last.txt", sched->st[selected].id, (int)strlen(sched->st[selected].id));
         char stage[48]; snprintf(stage, sizeof stage, "radio:%s", sched->st[selected].id);
@@ -767,7 +785,7 @@ static void retune_step(void) {
         if (now - ap_rt_at >= 2000) {
             ap_rt_at = now;
             if (ap_rt_steps++ < 20) {
-                dial_target = (float)((selected + 1) % sched->n);
+                dial_step(1);
                 LOG("autopilot: retune %d to %s", ap_rt_steps, sched->st[(selected + 1) % sched->n].id);
             } else { ap_rt_phase = 2; LOG("autopilot: holding on %s", sched->st[selected].id); }
         }
@@ -780,6 +798,37 @@ static void retune_step(void) {
             ap_done = 1; report_stage("clean"); data_write("autotest_done", "1", 1);
         }
         break;
+    }
+}
+
+static void seam_step(void) {
+    static const struct { float deg_per_s; int pad; uint32_t ms; } steps[] = {
+        { 0, 0, 20000 },        /* sound on the last station */
+        { 60, 0, 6000 },        /* slowly forward, half a station a second: 3 stations, across the seam */
+        { 0, 0, 20000 },
+        { -720, 0, 667 },       /* quickly back, 6 stations a second: 4 stations, across it again */
+        { 0, 0, 20000 },
+        { 0, 1, 1500 }, { 0, 1, 20000 },     /* d-pad right twice: across it */
+        { 0, -1, 1500 }, { 0, -1, 20000 },   /* d-pad left twice: back across it */
+        { 0, 0, 30000 },
+    };
+    if (!sched || selected < 0) return;
+    uint32_t now = tick_ms();
+    if (!ap_seam_at) { ap_seam_at = ap_seam_last = now; LOG("autopilot: seam test on %s", sched->st[selected].id); }
+    if (ap_seam_i >= (int)(sizeof steps / sizeof steps[0])) {
+        const player_stats_t *s = player_stats();
+        LOG("autopilot: done; on %s, %d tunes, %d first sounds, %d stream failures, state %d",
+            sched->st[selected].id, s->tunes, s->tune_ok, s->stream_fail, player_state());
+        ap_done = 1; report_stage("clean"); data_write("autotest_done", "1", 1);
+        return;
+    }
+    ap_crank_change += steps[ap_seam_i].deg_per_s * (now - ap_seam_last) / 1000.0f;
+    ap_seam_last = now;
+    if ((steps[ap_seam_i].deg_per_s != 0 || steps[ap_seam_i].pad) && now - ap_shot_at > 250) { ap_save_screen(); ap_shot_at = now; }
+    if (now - ap_seam_at >= steps[ap_seam_i].ms) {
+        ap_seam_at = now;
+        if (++ap_seam_i < (int)(sizeof steps / sizeof steps[0]) && steps[ap_seam_i].pad) dial_step(steps[ap_seam_i].pad);
+        LOG("autopilot: seam step %d, dial %.2f, on %s", ap_seam_i, (double)dial, sched->st[selected].id);
     }
 }
 
@@ -800,9 +849,10 @@ static int update(void *ud) {
         int64_t b = net_bytes_total();
         if (perf_at) app_fps = perf_frames * 1000.0f / ms;
         char nd[160]; net_describe(nd, sizeof nd);
-        if (perf_at) LOG("perf: %.1f fps, network %.0f KB/s, buffer %d ms, player %d, slowest frame %u ms; %s",
+        float load = player_decode_load();
+        if (perf_at) LOG("perf: %.1f fps, network %.0f KB/s, buffer %d ms, player %d, decoding %.0f%%%s, slowest frame %u ms; %s",
                          perf_frames * 1000.0 / ms, (b - perf_bytes) / 1.024 / ms, audio_buffered() * 1000 / RATE, player_state(),
-                         (unsigned)frame_max_ms, nd);
+                         load < 0 ? 0.0 : (double)(load * 100), player_lite() ? " (lite)" : "", (unsigned)frame_max_ms, nd);
         frame_max_ms = 0;
         perf_at = tick_ms(); perf_frames = 0; perf_bytes = b;
     }
@@ -810,7 +860,7 @@ static int update(void *ud) {
     report_update();
 
     PDButtons cur, pushed, rel;
-    if (autopilot && tick_ms() - ap_shot_at > 6000) { ap_save_screen(); ap_shot_at = tick_ms(); }
+    if (autopilot && !ap_seam && tick_ms() - ap_shot_at > 6000) { ap_save_screen(); ap_shot_at = tick_ms(); }
     switch (screen) {
     case SC_INTRO:
         pd->system->getButtonState(&cur, &pushed, &rel);
@@ -872,21 +922,29 @@ static int update(void *ud) {
             if (!ap_since || ap_since < 10) ap_since = tick_ms();
             if (ap_video) video_step();
             else if (ap_retune) retune_step();
+            else if (ap_seam) seam_step();
             else if (ap_radio_only) view = (tick_ms() - ap_since > 22000 && tick_ms() - ap_since < 34000) ? 1 : 0;
-            if (!ap_video && !ap_retune && sched && tick_ms() - ap_since > 40000) {
+            if (!ap_video && !ap_retune && !ap_seam && sched && tick_ms() - ap_since > (ap_radio_only ? ap_hold_ms : 40000)) {
                 ap_since = tick_ms();
-                if (ap_radio_only) { ap_done = 1; report_stage("clean"); data_write("autotest_done", "1", 1); LOG("autopilot: done"); }
-                else if (ap_steps++ < sched->n) dial_target = (float)((selected + 1) % sched->n);
+                if (ap_radio_only) {
+                    const player_stats_t *s = player_stats();
+                    LOG("autopilot: done; listened %u s, %d underruns, %d resyncs, %d lite, %d unsupported, MP3 decode %.0f%%, state %d",
+                        (unsigned)s->listen_s, audio_underruns(), s->resyncs, s->lite, s->unsupported,
+                        s->audio_s[0] > 0 ? (double)(s->decode_s[0] / s->audio_s[0] * 100) : 0.0, player_state());
+                    ap_done = 1; report_stage("clean"); data_write("autotest_done", "1", 1);
+                }
+                else if (ap_steps++ < sched->n) dial_step(1);
                 else { ap_done = 1; report_send_session(); data_write("autotest_done", "1", 1); LOG("autopilot: done"); }
             }
         }
         radio_input();
         if (sched && player_station() >= 0 && player_station() < sched->n && player_state() == PL_PLAYING) report_set_presence(sched->st[player_station()].id);
         else if (player_state() == PL_OFF) report_set_presence("");
-        /* decode for most of the frame (30 fps = 33 ms), leave room to draw */
-        player_update(0.022f);
-        uint32_t now = tick_ms();
+        /* Decode for most of the frame (30 fps = 33 ms). While the dial moves
+         * the screen redraws every frame, so leave more room to draw. */
         int animating = fabsf(dial - roundf(dial)) > 0.002f || dial_target >= 0 || player_state() == PL_TUNING || selected != player_station();
+        player_update(animating ? 0.022f : 0.027f);
+        uint32_t now = tick_ms();
         if (animating || now - last_draw > 500 || ap_video) { draw_radio(); last_draw = now; }
         if (ap_video) video_capture();
         break;
@@ -934,7 +992,17 @@ int eventHandler(PlaydateAPI *playdate, PDSystemEvent event, uint32_t arg) {
         } else if (ap && !strncmp(ap, "radio:", 6)) {
             ap_radio_only = 1;
             char *nl = strpbrk(ap, "\r\n"); if (nl) *nl = 0;
+            char *opt = strchr(ap + 6, ',');
+            if (opt) *opt++ = 0;
             data_write("last.txt", ap + 6, (int)strlen(ap + 6));
+            for (char *tok = opt ? strtok(opt, ",") : NULL; tok; tok = strtok(NULL, ",")) {
+                if (!strncmp(tok, "hold=", 5)) ap_hold_ms = (uint32_t)atoi(tok + 5) * 60000;
+                else if (!strncmp(tok, "slow=", 5)) { player_debug_slow_decode((float)atof(tok + 5)); LOG("player: decoding %s times slower (test)", tok + 5); }
+            }
+        } else if (ap && !strncmp(ap, "seam:", 5)) {
+            ap_radio_only = ap_seam = 1;
+            char *nl = strpbrk(ap, "\r\n"); if (nl) *nl = 0;
+            data_write("last.txt", ap + 5, (int)strlen(ap + 5));
         } else if (ap && !strncmp(ap, "retune:", 7)) {
             ap_radio_only = ap_retune = 1;
             char *nl = strpbrk(ap, "\r\n"); if (nl) *nl = 0;

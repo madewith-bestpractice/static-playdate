@@ -123,10 +123,10 @@ int report_send_session(void) {
     char p[1200];
     snprintf(p, sizeof p,
         "\"listen_s\":%u,\"tunes\":%d,\"tune_ok\":%d,\"tune_fail\":%d,\"tune_ms_avg\":%u,\"tune_ms_max\":%u,"
-        "\"underruns\":%d,\"stream_fail\":%d,\"reconnects\":%d,\"resyncs\":%d,\"unsupported\":%d,"
+        "\"underruns\":%d,\"stream_fail\":%d,\"reconnects\":%d,\"resyncs\":%d,\"unsupported\":%d,\"lite\":%d,"
         "\"cpu\":[%.1f,%.1f,%.1f,%.1f],\"audio_s\":[%.0f,%.0f,%.0f,%.0f],\"moov_kb\":%d,\"moov_ms\":%u,\"drift_ms\":%lld,\"fps\":%.1f",
         (unsigned)s->listen_s, s->tunes, s->tune_ok, s->tune_fail, (unsigned)(s->tune_ok ? s->tune_ms_sum / (uint32_t)s->tune_ok : 0), (unsigned)s->tune_ms_max,
-        audio_underruns(), s->stream_fail, s->reconnects, s->resyncs, s->unsupported,
+        audio_underruns(), s->stream_fail, s->reconnects, s->resyncs, s->unsupported, s->lite,
         (double)pct(s->decode_s[0], s->audio_s[0]), (double)pct(s->decode_s[1], s->audio_s[1]),
         (double)pct(s->decode_s[2], s->audio_s[2]), (double)pct(s->decode_s[3], s->audio_s[3]),
         (double)s->audio_s[0], (double)s->audio_s[1], (double)s->audio_s[2], (double)s->audio_s[3],

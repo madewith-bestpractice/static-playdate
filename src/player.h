@@ -17,6 +17,10 @@ const ep_t *player_episode(void);           /* live episode on the tuned station
 int player_station(void);
 int64_t player_drift_ms(void);              /* playback minus live (+ ahead) */
 uint32_t player_playing_since(void);        /* tick_ms when sound last started */
+int player_lite(void);                      /* this stream plays in lite mode (dec_set_lite) */
+float player_decode_load(void);             /* this stream's decode time over its audio time, -1 if not yet known */
+/* Simulator tests: make decoding take this many times longer, like a slower CPU. */
+void player_debug_slow_decode(float factor);
 
 /* Lifetime stats for the report. Formats: 0 MP3, 1 AAC-LC, 2 HE-AAC, 3 WAV. */
 typedef struct {
@@ -25,6 +29,7 @@ typedef struct {
     int tunes, tune_ok, tune_fail;
     uint32_t tune_ms_sum, tune_ms_max;      /* tune (click) to first sound */
     int stream_fail, reconnects, resyncs, unsupported;
+    int lite;                               /* streams switched to lite mode */
     uint32_t listen_s;
     int moov_kb_max;                        /* biggest MP4 index fetched */
     uint32_t moov_ms_max;

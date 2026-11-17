@@ -42,6 +42,7 @@
  *               followed by polyphase filter)
  **************************************************************************************/
 
+#include <string.h>
 #include "coder.h"
 #include "assembly.h"
 
@@ -70,7 +71,29 @@ int Subband(MP3DecInfo *mp3DecInfo, short *pcmBuf)
 	mi = (IMDCTInfo *)(mp3DecInfo->IMDCTInfoPS);
 	sbi = (SubbandInfo*)(mp3DecInfo->SubbandInfoPS);
 
-	if (mp3DecInfo->nChans == 2) {
+	if (mp3DecInfo->monoOut) {
+		/* mono output: the filterbank is linear, so mix first and run it once */
+		int gb = mi->gb[0];
+		if (mp3DecInfo->nChans == 2) {
+			int *l = mi->outBuf[0][0], *r = mi->outBuf[1][0];
+			for (b = 0; b < BLOCK_SIZE * NBANDS; b++)
+				l[b] = (l[b] >> 1) + (r[b] >> 1);
+			gb = MIN(gb, mi->gb[1]);	/* the mix is never louder than the louder channel */
+		}
+		for (b = 0; b < BLOCK_SIZE; b++) {
+			if (mp3DecInfo->halfRate)
+				memset(&mi->outBuf[0][b][NBANDS / 2], 0, NBANDS / 2 * sizeof(int));
+			FDCT32(mi->outBuf[0][b], sbi->vbuf + 0*32, sbi->vindex, (b & 0x01), gb);
+			if (mp3DecInfo->halfRate) {
+				PolyphaseMonoHalf(pcmBuf, sbi->vbuf + sbi->vindex + VBUF_LENGTH * (b & 0x01), polyCoef);
+				pcmBuf += NBANDS / 2;
+			} else {
+				PolyphaseMono(pcmBuf, sbi->vbuf + sbi->vindex + VBUF_LENGTH * (b & 0x01), polyCoef);
+				pcmBuf += NBANDS;
+			}
+			sbi->vindex = (sbi->vindex - (b & 0x01)) & 7;
+		}
+	} else if (mp3DecInfo->nChans == 2) {
 		/* stereo */
 		for (b = 0; b < BLOCK_SIZE; b++) {
 			FDCT32(mi->outBuf[0][b], sbi->vbuf + 0*32, sbi->vindex, (b & 0x01), mi->gb[0]);

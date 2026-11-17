@@ -331,7 +331,7 @@ static int DecodeFillElement(AACDecInfo *aacDecInfo, BitStreamInfo *bsi)
 	 */
 	if (psi->fillCount > 0) {
 		aacDecInfo->fillExtType = (int)((psi->fillBuf[0] >> 4) & 0x0f);
-		if (aacDecInfo->fillExtType == EXT_SBR_DATA || aacDecInfo->fillExtType == EXT_SBR_DATA_CRC)
+		if ((aacDecInfo->fillExtType == EXT_SBR_DATA || aacDecInfo->fillExtType == EXT_SBR_DATA_CRC) && !aacDecInfo->skipSBR)
 			aacDecInfo->sbrEnabled = 1;
 	}
 #endif

@@ -5,6 +5,7 @@
  * object (pj_t) so the tuned station and background warming can each run one.
  * Results are cached per episode URL; a warmed episode tunes with a single
  * ranged request. */
+#include <math.h>
 #include "common.h"
 #include "player.h"
 #include "audio.h"
@@ -23,6 +24,12 @@
 #define WARM_REST_MS 30000       /* after a failed background probe, leave the network alone this long */
 #define GIVE_UP_FAILS 6          /* then stop saying "reconnecting" and retry once a minute */
 #define GIVE_UP_RETRY_MS 60000
+/* Decoding speed, as decode time over audio time, judged after JUDGE_S of a
+ * stream's audio. The radio gives the decoder about two thirds of each frame
+ * while the dial moves and four fifths while it rests. */
+#define JUDGE_S 4
+#define LITE_ABOVE 0.6f          /* switch the stream to lite mode */
+#define HEAVY_ABOVE 0.8f         /* in lite mode (or none), while buffering: too heavy to play */
 
 /* ---------- probe cache ---------- */
 
@@ -281,7 +288,7 @@ static int pj_poll(pj_t *j) {
 static const sched_t *sch;
 static int tuned = -1;
 static int state = PL_OFF;
-static char status[64];
+static char status[80];
 static pj_t job, warm;
 static player_stats_t stats;
 /* This stream's decode speed. stats adds up the whole run, so judging a station
@@ -311,6 +318,8 @@ static uint32_t listen_mark;
 static uint32_t playing_since;
 static int16_t pcm[8192];
 static uint8_t netbuf[8192];
+static char unsupported_why[24]; /* shown with the time to the next show; keep it short */
+static float slow_decode = 1;    /* Simulator tests: stretch decode time like a slower CPU */
 
 const player_stats_t *player_stats(void) { return &stats; }
 int player_state(void) { return state; }
@@ -320,6 +329,23 @@ int64_t player_drift_ms(void) { return drift; }
 uint32_t player_playing_since(void) { return playing_since; }
 
 static void set_status(const char *s) { snprintf(status, sizeof status, "%s", s); }
+
+void player_debug_slow_decode(float factor) { slow_decode = factor; }
+
+/* Simulator tests: wait out slow_decode times this step's usual decode time.
+ * The usual time per output sample follows drops quickly and rises slowly, so
+ * a moment's hiccup on the Mac isn't multiplied too. */
+static float stretch_decode(float t0, float dt, int n) {
+    static float per_sample;
+    float x = dt / n;
+    if (per_sample <= 0) per_sample = x;
+    else if (x < per_sample) per_sample += (x - per_sample) * 0.5f;
+    else per_sample += (fminf(x, 2 * per_sample) - per_sample) * 0.02f;
+    while (cpu_s() < t0 + per_sample * n * slow_decode) {}
+    return cpu_s() - t0;
+}
+int player_lite(void) { return dec && dec_is_lite(dec); }
+float player_decode_load(void) { return dec && stream_audio_s > 1 ? stream_decode_s / stream_audio_s : -1; }
 
 void player_init(void) { memset(&stats, 0, sizeof stats); }
 
@@ -347,6 +373,17 @@ static void stop_all(void) {
     audio_play(0);
     audio_flush();
     play_head_ms = -1;
+}
+
+/* This episode can't play here: say why, and wait in the gap for the next one. */
+static void unsupported(const char *why) {
+    stop_stream();
+    stats.unsupported++;
+    state = PL_UNSUPPORTED;
+    snprintf(unsupported_why, sizeof unsupported_why, "%s", why);
+    set_status(why);
+    audio_hiss(0.3f);
+    sub = S_GAP;
 }
 
 void player_set_schedule(const sched_t *s) {
@@ -531,11 +568,12 @@ static void pump_stream(float budget_s) {
         float t0 = cpu_s();
         int n = dec_step(dec, pcm, (int)(sizeof pcm / sizeof pcm[0]));
         float dt = cpu_s() - t0;
+        if (slow_decode > 1 && n > 0) dt = stretch_decode(t0, dt, n);
         if (n == -1) break;                              /* waiting for bytes */
         if (n == -2) {                                   /* end of file (or broken) */
             int fr = dec_frames(dec);
             stop_stream();
-            if (fr == 0 && sub != S_PLAY) { stats.unsupported++; state = PL_UNSUPPORTED; set_status("Can't decode this one yet"); }
+            if (fr == 0 && sub != S_PLAY) unsupported("Can't play this one");
             sub = S_GAP;
             break;
         }
@@ -583,14 +621,18 @@ static void pump_stream(float budget_s) {
         }
     }
 
-    /* slower than real time: this Playdate can't keep up with this format */
-    if (sub == S_ALIGN && stream_audio_s > 8 && stream_decode_s > stream_audio_s * 0.97f) {
-        stop_stream();
-        stats.unsupported++;
-        state = PL_UNSUPPORTED;
-        set_status(fmt_class == 2 ? "HE-AAC is too heavy for the Playdate" : "Too heavy for the Playdate");
-        sub = S_GAP;
-        return;
+    /* Too slow to keep up on this Playdate: try lite mode, then give up on this episode */
+    if (stream_audio_s >= JUDGE_S) {
+        float r = stream_decode_s / stream_audio_s;
+        if (r > LITE_ABOVE && !dec_is_lite(dec) && dec_set_lite(dec)) {
+            LOG("decoding takes %.0f%% of real time: lite mode", (double)(r * 100));
+            stats.lite++;
+            stream_audio_s = stream_decode_s = 0;
+        } else if (sub == S_ALIGN && r > HEAVY_ABOVE) {
+            LOG("decoding takes %.0f%% of real time%s: too heavy", (double)(r * 100), dec_is_lite(dec) ? " in lite mode" : "");
+            unsupported("Too heavy to play");
+            return;
+        }
     }
     if (sub == S_ALIGN && play_head_ms >= 0) {
         int64_t now_off = wall_ms() - slot_start_ms;
@@ -698,11 +740,8 @@ void player_update(float budget_s) {
                 char m[64];
                 snprintf(m, sizeof m, "Can't reach this show (%.36s)", job.err);
                 if (!strcmp(job.err, "not AAC") || !strcmp(job.err, "unknown format") || !strcmp(job.err, "WAV format")) {
-                    stats.unsupported++;
-                    state = PL_UNSUPPORTED;
-                    set_status("Can't play this format yet");
                     pj_reset(&job);
-                    sub = S_GAP;
+                    unsupported("Can't play this one");
                 } else {
                     stats.tune_fail += !tune_counted && fails == 0;
                     trouble(m, fails < 3 ? 3000 : 10000);
@@ -722,6 +761,11 @@ void player_update(float budget_s) {
         if (state == PL_PLAYING || state == PL_TUNING) {
             if (audio_buffered() == 0) audio_expect_gap();
             if (state == PL_TUNING) { state = PL_GAP; set_status("Next show in a moment"); audio_hiss(0.3f); }
+        }
+        if (state == PL_UNSUPPORTED) {
+            int min = (int)((sched_slot_remaining(sch, tuned, wall_ms()) + 59999) / 60000);
+            if (min > 1) snprintf(status, sizeof status, "%s. Next show in %d min", unsupported_why, min);
+            else snprintf(status, sizeof status, "%s. Next show in a moment", unsupported_why);
         }
         break;
     case S_WAIT:

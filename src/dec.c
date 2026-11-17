@@ -26,7 +26,7 @@ struct dec {
     int last;
     int64_t out_samples, start_ms;
     int gain_q12;
-    int frames, errors, sbr;
+    int frames, errors, sbr, lite;
 };
 
 dec_t *dec_new(int fmt, int64_t first_byte, int64_t start_ms,
@@ -37,8 +37,10 @@ dec_t *dec_new(int fmt, int64_t first_byte, int64_t start_ms,
     d->pos = first_byte;
     d->start_ms = start_ms;
     d->gain_q12 = 4096;
-    if (fmt == FMT_MP3) d->mp3 = MP3InitDecoder();
-    else if (fmt == FMT_MP4 || fmt == FMT_ADTS) {
+    if (fmt == FMT_MP3) {
+        d->mp3 = MP3InitDecoder();
+        if (d->mp3) MP3SetMonoOutput(d->mp3, 0);
+    } else if (fmt == FMT_MP4 || fmt == FMT_ADTS) {
         d->aac = AACInitDecoder();
         if (d->aac && fmt == FMT_MP4) {
             AACFrameInfo fi = {0};
@@ -61,10 +63,12 @@ void dec_free(dec_t *d) {
     free(d);
 }
 
-int dec_space(const dec_t *d) { return IN_CAP - (d->len - d->off); }
+/* Bytes are appended at the end; what's been decoded is only moved out of the
+ * way once it's half the buffer, so each byte is moved at most once. */
+int dec_space(const dec_t *d) { return IN_CAP - d->len + (d->off >= IN_CAP / 2 ? d->off : 0); }
 
 void dec_push(dec_t *d, const uint8_t *b, int n) {
-    if (d->len + n > IN_CAP && d->off) {
+    if (d->len + n > IN_CAP && d->off >= IN_CAP / 2) {
         memmove(d->in, d->in + d->off, (size_t)(d->len - d->off));
         d->len -= d->off; d->pos += d->off; d->off = 0;
     }
@@ -75,29 +79,35 @@ void dec_push(dec_t *d, const uint8_t *b, int n) {
 
 void dec_end_input(dec_t *d) { d->eof = 1; }
 
+/* Mix to mono, apply the gain and resample to RATE (linear, one input sample behind). */
 static int emit(dec_t *d, const int16_t *pcm, int frames, int ch, int rate, int16_t *out, int cap) {
     if (rate <= 0 || frames <= 0) return 0;
     if (rate != d->in_rate) { d->in_rate = rate; d->step = (uint32_t)(((uint64_t)rate << 16) / RATE); }
     d->ch = ch;
-    int n = 0, last = d->last;
+    int n = 0, last = d->last, g = d->gain_q12;
     uint32_t ph = d->phase, step = d->step;
     for (int i = 0; i < frames; i++) {
         int s = ch == 2 ? (pcm[2 * i] + pcm[2 * i + 1]) >> 1 : pcm[i];
-        while (ph < 65536 && n < cap) {
-            out[n++] = (int16_t)(last + (((s - last) * (int)(ph >> 1)) >> 15));
-            ph += step;
+        if (g != 4096) {
+            s = (s * g) >> 12;
+            s = s > 32767 ? 32767 : s < -32768 ? -32768 : s;
         }
-        ph -= 65536;
+        /* the same rate, and exactly half (lite MP3): what the loop gives, quicker */
+        if (ph == 0 && step == 65536) {
+            if (n < cap) out[n++] = (int16_t)last;
+        } else if (ph == 0 && step == 32768 && n + 2 <= cap) {
+            out[n++] = (int16_t)last;
+            out[n++] = (int16_t)((last + s) >> 1);
+        } else {
+            while (ph < 65536 && n < cap) {
+                out[n++] = (int16_t)(last + (((s - last) * (int)(ph >> 1)) >> 15));
+                ph += step;
+            }
+            ph -= 65536;
+        }
         last = s;
     }
     d->phase = ph; d->last = last;
-    if (d->gain_q12 != 4096) {
-        int g = d->gain_q12;
-        for (int i = 0; i < n; i++) {
-            int v = (out[i] * g) >> 12;
-            out[i] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
-        }
-    }
     d->out_samples += n;
     return n;
 }
@@ -128,7 +138,7 @@ static int after_aac(dec_t *d, int16_t *out, int cap) {
     AACGetLastFrameInfo(d->aac, &fi);
     if (fi.outputSamps <= 0 || fi.nChans <= 0) return 0;
     d->frames++;
-    d->sbr = fi.sampRateOut >= 2 * fi.sampRateCore;
+    if (fi.sampRateOut >= 2 * fi.sampRateCore) d->sbr = 1;   /* stays set if lite mode drops SBR */
     return emit(d, d->pcm, fi.outputSamps / fi.nChans, fi.nChans, fi.sampRateOut, out, cap);
 }
 
@@ -199,6 +209,16 @@ int dec_channels(const dec_t *d) { return d->ch; }
 int dec_errors(const dec_t *d) { return d->errors; }
 int dec_frames(const dec_t *d) { return d->frames; }
 int dec_is_sbr(const dec_t *d) { return d->sbr; }
+
+int dec_set_lite(dec_t *d) {
+    if (d->lite) return 1;
+    if (d->mp3) MP3SetMonoOutput(d->mp3, 1);
+    else if (d->aac && d->sbr) AACSkipSBR(d->aac, 1);
+    else return 0;
+    d->lite = 1;
+    return 1;
+}
+int dec_is_lite(const dec_t *d) { return d->lite; }
 void dec_set_gain_db(dec_t *d, float db) {
     if (db > 6) db = 6;         /* the phone's loudness boost ceiling */
     if (db < -18) db = -18;

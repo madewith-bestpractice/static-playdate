@@ -98,6 +98,7 @@
 #define	IntensityProcMPEG1	STATNAME(IntensityProcMPEG1)
 #define	IntensityProcMPEG2	STATNAME(IntensityProcMPEG2)
 #define PolyphaseMono		STATNAME(PolyphaseMono)
+#define PolyphaseMonoHalf	STATNAME(PolyphaseMonoHalf)
 #define PolyphaseStereo		STATNAME(PolyphaseStereo)
 #define FDCT32				STATNAME(FDCT32)
 
@@ -290,6 +291,7 @@ extern const int quadTabMaxBits[2];
 extern "C" {
 #endif
 void PolyphaseMono(short *pcm, int *vbuf, const int *coefBase);
+void PolyphaseMonoHalf(short *pcm, int *vbuf, const int *coefBase);
 void PolyphaseStereo(short *pcm, int *vbuf, const int *coefBase);
 #ifdef __cplusplus
 }

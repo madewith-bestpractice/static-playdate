@@ -739,6 +739,10 @@ int IMDCT(MP3DecInfo *mp3DecInfo, int gr, int ch)
 	hi = (HuffmanInfo*)(mp3DecInfo->HuffmanInfoPS);
 	mi = (IMDCTInfo *)(mp3DecInfo->IMDCTInfoPS);
 
+	/* half-rate output uses subbands 0-15 only (Subband zeroes the rest) */
+	if (mp3DecInfo->halfRate)
+		hi->nonZeroBound[ch] = MIN(hi->nonZeroBound[ch], NBANDS / 2 * 18);
+
 	/* anti-aliasing done on whole long blocks only
 	 * for mixed blocks, nBfly always 1, except 3 for 8 kHz MPEG 2.5 (see sfBandTab) 
      *   nLongBlocks = number of blocks with (possibly) non-zero power 

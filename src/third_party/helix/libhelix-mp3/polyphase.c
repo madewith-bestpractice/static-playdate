@@ -176,6 +176,51 @@ void PolyphaseMono(short *pcm, int *vbuf, const int *coefBase)
 	}
 }
 
+/**************************************************************************************
+ * Function:    PolyphaseMonoHalf
+ *
+ * Description: PolyphaseMono's even output samples only: 16 PCM samples at half
+ *                the sample rate. Subbands 16-31 must be zero (no aliasing).
+ **************************************************************************************/
+void PolyphaseMonoHalf(short *pcm, int *vbuf, const int *coefBase)
+{	
+	int i;
+	const int *coef;
+	int *vb1;
+	int vLo, vHi, c1, c2;
+	Word64 sum1L, sum2L, rndVal;
+
+	rndVal = (Word64)( 1 << (DEF_NFRACBITS - 1 + (32 - CSHIFT)) );
+
+	/* output sample 0 */
+	coef = coefBase;
+	vb1 = vbuf;
+	sum1L = rndVal;
+	MC0M(0) MC0M(1) MC0M(2) MC0M(3) MC0M(4) MC0M(5) MC0M(6) MC0M(7)
+	pcm[0] = ClipToShort((int)SAR64(sum1L, (32-CSHIFT)), DEF_NFRACBITS);
+
+	/* output sample 16 */
+	coef = coefBase + 256;
+	vb1 = vbuf + 64*16;
+	sum1L = rndVal;
+	MC1M(0) MC1M(1) MC1M(2) MC1M(3) MC1M(4) MC1M(5) MC1M(6) MC1M(7)
+	pcm[8] = ClipToShort((int)SAR64(sum1L, (32-CSHIFT)), DEF_NFRACBITS);
+
+	/* output samples 16-i and 16+i for even i (each pair takes 16 coefficients and 64 vbuf entries) */
+	coef = coefBase + 16;
+	vb1 = vbuf + 64;
+	for (i = 15; i > 0; i--, vb1 += 64) {
+		if (i & 1) {
+			coef += 16;
+			continue;
+		}
+		sum1L = sum2L = rndVal;
+		MC2M(0) MC2M(1) MC2M(2) MC2M(3) MC2M(4) MC2M(5) MC2M(6) MC2M(7)
+		pcm[(16 - i) / 2] = ClipToShort((int)SAR64(sum1L, (32-CSHIFT)), DEF_NFRACBITS);
+		pcm[(16 + i) / 2] = ClipToShort((int)SAR64(sum2L, (32-CSHIFT)), DEF_NFRACBITS);
+	}
+}
+
 #define MC0S(x)	{ \
 	c1 = *coef;		coef++;		c2 = *coef;		coef++; \
 	vLo = *(vb1+(x));		vHi = *(vb1+(23-(x))); \
