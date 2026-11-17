@@ -225,6 +225,14 @@ int AACSetRawBlockParams(HAACDecoder hAACDecoder, int copyLast, AACFrameInfo *aa
 		return SetRawBlockParams(aacDecInfo, 0, aacFrameInfo->nChans, aacFrameInfo->sampRateCore, aacFrameInfo->profile);
 }
 
+void AACSkipSBR(HAACDecoder hAACDecoder, int skip)
+{
+	AACDecInfo *aacDecInfo = (AACDecInfo *)hAACDecoder;
+
+	if (aacDecInfo)
+		aacDecInfo->skipSBR = skip;
+}
+
 /**************************************************************************************
  * Function:    AACFlushCodec
  *

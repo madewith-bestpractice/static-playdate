@@ -159,6 +159,7 @@ typedef struct _AACDecInfo {
 	int profile;
 	int format;
 	int sbrEnabled;
+	int skipSBR;		/* AACSkipSBR */
 	int tnsUsed;
 	int pnsUsed;
 	int frameCount;

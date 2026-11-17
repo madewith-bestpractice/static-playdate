@@ -159,6 +159,10 @@ void AACGetLastFrameInfo(HAACDecoder hAACDecoder, AACFrameInfo *aacFrameInfo);
 int AACSetRawBlockParams(HAACDecoder hAACDecoder, int copyLast, AACFrameInfo *aacFrameInfo);
 int AACFlushCodec(HAACDecoder hAACDecoder);
 
+/* Static for Playdate: ignore SBR (HE-AAC's upper band) from the next frame
+ * on, and output the core band at the core sample rate. */
+void AACSkipSBR(HAACDecoder hAACDecoder, int skip);
+
 #ifdef HELIX_CONFIG_AAC_GENERATE_TRIGTABS_FLOAT
 int AACInitTrigtabsFloat(void);
 void AACFreeTrigtabsFloat(void);

@@ -88,7 +88,8 @@ attach these to [issue #1](https://github.com/madewith-bestpractice/static-playd
 ## Use
 
 - **Turn the crank** to tune (a third of a turn per station), or press
-  **left/right** on the D-pad.
+  **left/right** on the D-pad. The dial goes round: past the last station
+  comes the first again.
 - **Ⓐ** mutes. **Ⓑ** shows the episode's info with a QR code to its web page;
   press it again for stats (decoding CPU, buffer, sync drift, tune times, frame
   rate), and once more to go back to the dial.
@@ -110,6 +111,12 @@ mixed to mono for the Playdate's speaker. MP4 files need their index
 downloaded first; for SHEILA's three-hour shows that's about 1 MB, so tuning
 there takes longer. Decoding is fixed point (Helix), so it doesn't need the
 FPU.
+
+If a show is too heavy for your Playdate to decode in full, Static switches it
+to **lite** mode after a few seconds: MP3 is decoded at half the sample rate
+(sound up to about 11 kHz) and HE-AAC without its upper band. That loses the
+highest sounds, which you'd mostly notice on headphones. The stats view (press Ⓑ twice) says "lite" when it's on. If even lite
+is too heavy, Static says so and plays the station's next show when it starts.
 
 ## Build
 

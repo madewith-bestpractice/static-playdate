@@ -93,6 +93,8 @@ typedef struct _MP3DecInfo {
 
 	int part23Length[MAX_NGRAN][MAX_NCHAN];
 
+	int monoOut, halfRate;	/* MP3SetMonoOutput */
+
 } MP3DecInfo;
 
 typedef struct _SFBandTable {

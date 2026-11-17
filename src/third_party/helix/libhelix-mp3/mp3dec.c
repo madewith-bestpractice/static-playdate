@@ -200,11 +200,13 @@ void MP3GetLastFrameInfo(HMP3Decoder hMP3Decoder, MP3FrameInfo *mp3FrameInfo)
 		mp3FrameInfo->layer = 0;
 		mp3FrameInfo->version = 0;
 	} else {
+		int outChans = mp3DecInfo->monoOut ? 1 : mp3DecInfo->nChans;
+		int rateShift = mp3DecInfo->halfRate ? 1 : 0;
 		mp3FrameInfo->bitrate = mp3DecInfo->bitrate;
-		mp3FrameInfo->nChans = mp3DecInfo->nChans;
-		mp3FrameInfo->samprate = mp3DecInfo->samprate;
+		mp3FrameInfo->nChans = outChans;
+		mp3FrameInfo->samprate = mp3DecInfo->samprate >> rateShift;
 		mp3FrameInfo->bitsPerSample = 16;
-		mp3FrameInfo->outputSamps = mp3DecInfo->nChans * (int)samplesPerFrameTab[mp3DecInfo->version][mp3DecInfo->layer - 1];
+		mp3FrameInfo->outputSamps = outChans * ((int)samplesPerFrameTab[mp3DecInfo->version][mp3DecInfo->layer - 1] >> rateShift);
 		mp3FrameInfo->layer = mp3DecInfo->layer;
 		mp3FrameInfo->version = mp3DecInfo->version;
 	}
@@ -237,6 +239,16 @@ int MP3GetNextFrameInfo(HMP3Decoder hMP3Decoder, MP3FrameInfo *mp3FrameInfo, uns
 	MP3GetLastFrameInfo(mp3DecInfo, mp3FrameInfo);
 
 	return ERR_MP3_NONE;
+}
+
+void MP3SetMonoOutput(HMP3Decoder hMP3Decoder, int halfRate)
+{
+	MP3DecInfo *mp3DecInfo = (MP3DecInfo *)hMP3Decoder;
+
+	if (!mp3DecInfo)
+		return;
+	mp3DecInfo->monoOut = 1;
+	mp3DecInfo->halfRate = halfRate ? 1 : 0;
 }
 
 /**************************************************************************************
@@ -473,7 +485,7 @@ int MP3Decode(HMP3Decoder hMP3Decoder, unsigned char **inbuf, int *bytesLeft, sh
 			time = systime_get();
 		#endif
 		/* subband transform - if stereo, interleaves pcm LRLRLR */
-		if (Subband(mp3DecInfo, outbuf + gr*mp3DecInfo->nGranSamps*mp3DecInfo->nChans) < 0) {
+		if (Subband(mp3DecInfo, outbuf + gr * (mp3DecInfo->nGranSamps >> mp3DecInfo->halfRate) * (mp3DecInfo->monoOut ? 1 : mp3DecInfo->nChans)) < 0) {
 			MP3ClearBadFrame(mp3DecInfo, outbuf);
 			return ERR_MP3_INVALID_SUBBAND;			
 		}

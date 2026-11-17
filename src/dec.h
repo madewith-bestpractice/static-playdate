@@ -31,4 +31,9 @@ int dec_channels(const dec_t *d);
 int dec_errors(const dec_t *d);
 int dec_frames(const dec_t *d);
 int dec_is_sbr(const dec_t *d);                   /* AAC with SBR (HE-AAC) */
+/* Lite mode, for streams too heavy to decode in full: MP3 at half the sample
+ * rate (sound up to about 11 kHz), HE-AAC without its SBR upper band. Takes
+ * effect from the next frame. 0 if this stream has no lighter mode. */
+int dec_set_lite(dec_t *d);
+int dec_is_lite(const dec_t *d);
 void dec_set_gain_db(dec_t *d, float db);
