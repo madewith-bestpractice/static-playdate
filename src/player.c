@@ -4,7 +4,13 @@
  * Probing (what is this file, where does a time offset live) is a small job
  * object (pj_t) so the tuned station and background warming can each run one.
  * Results are cached per episode URL; a warmed episode tunes with a single
- * ranged request. */
+ * ranged request.
+ *
+ * The episode comes down in ranges of about 40 s of audio, read as fast as
+ * they arrive into a buffer of about 90 s, with the connection closed between
+ * them. The Playdate's network can't have a second connection open while one
+ * is downloading (net.c), and a stream held open at playback speed would
+ * leave no room for anything else: the next show, the listener count. */
 #include <math.h>
 #include "common.h"
 #include "player.h"
@@ -30,6 +36,11 @@
 #define JUDGE_S 4
 #define LITE_ABOVE 0.6f          /* switch the stream to lite mode */
 #define HEAVY_ABOVE 0.8f         /* in lite mode (or none), while buffering: too heavy to play */
+#define BUF_S 90                 /* compressed audio kept ahead, at most */
+#define CHUNK_S 40               /* fetched per request */
+#define SBUF_MAX (2 * 1024 * 1024)
+#define SBUF_MIN (256 * 1024)
+#define CHUNK_RETRIES 3          /* a range that fails is tried again while the buffer lasts */
 
 /* ---------- probe cache ---------- */
 
@@ -301,8 +312,18 @@ static char ep_url[2048];
 static int64_t slot_start_ms;     /* wall time the live episode began */
 static int64_t audio_end_ms;      /* media time to stop at (duration / bulletin cap) */
 static float ep_gain;
-static hs_t *stream;
+static hs_t *stream;             /* the range being fetched, NULL between ranges */
 static dec_t *dec;
+/* the stream buffer: a ring of compressed bytes ahead of the decoder */
+static uint8_t *sbuf;
+static int sbuf_max;
+static int s_cap, s_head, s_len, s_chunk;
+static int64_t s_next, s_total;   /* next file byte to fetch; file size, -1 unknown */
+static int64_t s_req_from, s_req_len;
+static float s_rate;              /* bytes per second of audio (estimated) */
+static int s_eof, s_fed_eof, s_fails;
+static uint32_t s_retry_at;
+static char s_url[4096];
 static int fmt_class;             /* stats bucket */
 static uint32_t tune_t0;          /* click time, for time-to-sound */
 static int tune_counted;
@@ -317,9 +338,9 @@ static uint32_t warm_rest_until;
 static uint32_t listen_mark;
 static uint32_t playing_since;
 static int16_t pcm[8192];
-static uint8_t netbuf[8192];
 static char unsupported_why[24]; /* shown with the time to the next show; keep it short */
 static float slow_decode = 1;    /* Simulator tests: stretch decode time like a slower CPU */
+static int dbg_spoil_link;       /* Simulator tests: break the stream's link once, like an expired signature */
 
 const player_stats_t *player_stats(void) { return &stats; }
 int player_state(void) { return state; }
@@ -331,6 +352,7 @@ uint32_t player_playing_since(void) { return playing_since; }
 static void set_status(const char *s) { snprintf(status, sizeof status, "%s", s); }
 
 void player_debug_slow_decode(float factor) { slow_decode = factor; }
+void player_debug_spoil_link(void) { dbg_spoil_link = 1; }
 
 /* Simulator tests: wait out slow_decode times this step's usual decode time.
  * The usual time per output sample follows drops quickly and rises slowly, so
@@ -345,6 +367,7 @@ static float stretch_decode(float t0, float dt, int n) {
     return cpu_s() - t0;
 }
 int player_lite(void) { return dec && dec_is_lite(dec); }
+float player_ahead_s(void) { return dec && s_rate > 0 ? s_len / s_rate : 0; }
 float player_decode_load(void) { return dec && stream_audio_s > 1 ? stream_decode_s / stream_audio_s : -1; }
 
 void player_init(void) { memset(&stats, 0, sizeof stats); }
@@ -365,6 +388,8 @@ const ep_t *player_episode(void) { return live(tuned, NULL, NULL); }
 static void stop_stream(void) {
     if (stream) { hs_close(stream); stream = NULL; }
     if (dec) { dec_free(dec); dec = NULL; }
+    s_head = s_len = 0;
+    s_eof = s_fed_eof = s_fails = 0;
 }
 
 static void stop_all(void) {
@@ -416,6 +441,34 @@ static int classify(int fmt) {
     return 1;   /* AAC: refined to HE-AAC once the decoder reports SBR */
 }
 
+/* Bytes per second of audio, to size the buffer and the ranges. */
+static float byte_rate(const probe_t *p) {
+    if (p->fmt == FMT_MP3 && p->mp3.byte_rate > 0) return (float)p->mp3.byte_rate;
+    if (p->fmt == FMT_MP3 && p->mp3.bitrate_kbps > 0) return p->mp3.bitrate_kbps * 125.0f;
+    if (p->fmt == FMT_WAV) return (float)p->wav_rate * p->wav_ch * 2;
+    if (p->total > 0 && audio_end_ms > 0) return (float)p->total * 1000.0f / (float)audio_end_ms;
+    return 24000;                                    /* 192 kbps */
+}
+
+/* Ask for the next range once a whole one fits in the buffer. */
+static void fetch_next(void) {
+    if (stream || s_eof || (int32_t)(tick_ms() - s_retry_at) < 0) return;
+    int64_t want = s_chunk;
+    if (s_total > 0 && s_total - s_next < want) want = s_total - s_next;
+    if (want <= 0) { s_eof = 1; return; }
+    if (s_cap - s_len < want) return;
+    if (dbg_spoil_link && sub == S_PLAY) {           /* test: the link stops working */
+        dbg_spoil_link = 0;
+        char *path = strstr(s_url, "://");
+        path = path ? strchr(path + 3, '/') : NULL;
+        if (path) snprintf(path, sizeof s_url - (size_t)(path - s_url), "/static-test-expired-link.mp3");
+        LOG("player: test: spoiling the stream's link: %.80s", s_url);
+    }
+    stream = hs_open(s_url, "GET", s_next, s_next + want - 1, NULL, 0, NULL);
+    hs_set_priority(stream, NET_PRIO_HIGH);
+    s_req_from = s_next; s_req_len = want;
+}
+
 /* open the stream for the live episode at the live offset (+ expected latency) */
 static void start_stream(const probe_t *p) {
     int64_t off;
@@ -445,10 +498,26 @@ static void start_stream(const probe_t *p) {
     dec_set_gain_db(dec, ep_gain);
     fmt_class = classify(p->fmt);
     stream_audio_s = stream_decode_s = 0;
-    stream = hs_open(p->final, "GET", byte, -1, NULL, 0, NULL);
-    hs_set_priority(stream, NET_PRIO_HIGH);
+    if (!sbuf) {                                     /* once, and kept: big blocks fragment the heap */
+        for (sbuf_max = SBUF_MAX; sbuf_max >= SBUF_MIN && !(sbuf = malloc((size_t)sbuf_max)); sbuf_max /= 2) {}
+        if (!sbuf) { dec_free(dec); dec = NULL; set_status("Out of memory"); sub = S_WAIT; retry_at = tick_ms() + 5000; return; }
+    }
+    s_rate = byte_rate(p);
+    s_cap = (int)fminf(s_rate * BUF_S, (float)sbuf_max);
+    if (s_cap < SBUF_MIN) s_cap = sbuf_max < SBUF_MIN ? sbuf_max : SBUF_MIN;
+    s_chunk = (int)fminf(s_rate * CHUNK_S, (float)(s_cap / 2));
+    s_head = s_len = 0;
+    s_eof = s_fed_eof = s_fails = 0;
+    s_next = byte;
+    s_total = p->total > 0 ? p->total : -1;
+    s_retry_at = tick_ms();
+    snprintf(s_url, sizeof s_url, "%s", p->final);
+    fetch_next();
     sub = S_CONNECT;
     play_head_ms = -1;
+    /* Audio decoded for a stream that broke before it played would fill the
+     * ring, and this one could never queue its first sample. */
+    if (!audio_playing()) audio_flush();
 }
 
 static void begin_episode(void) {
@@ -478,7 +547,8 @@ static void trouble(const char *why, uint32_t retry_ms) {
          * Turning the dial away and back tries again straight away. */
         char n[160]; net_describe(n, sizeof n);
         if (fails == GIVE_UP_FAILS + 1) LOG("player: %d tries failed (%s); now retrying once a minute (%s)", GIVE_UP_FAILS, why, n);
-        why = net_stuck() ? "The network stopped answering. Retrying" : "Can't reach this show. Trying again soon";
+        why = net_wedged() ? "The network stopped answering. Reopening Static may help"
+            : net_stuck() ? "The network stopped answering. Retrying" : "Can't reach this show. Trying again soon";
         retry_ms = GIVE_UP_RETRY_MS;
     }
     set_status(why);
@@ -515,30 +585,80 @@ static void stream_lost(const char *why, int http) {
     trouble("Lost the stream, reconnecting", wait);
 }
 
+/* A range failed. While the buffer still has a while to play, try it again
+ * quietly; otherwise reconnect at the live position as before. */
+static void range_failed(const char *why, int http) {
+    if (http == 403 || http == 404 || http == 410) cache_drop(ep_url);   /* stale signed link */
+    float ahead_s = s_len / s_rate + (float)audio_buffered() / RATE;
+    if (sub == S_PLAY && http < 400 && ahead_s > 10 && s_fails < CHUNK_RETRIES) {
+        s_fails++;
+        hs_close(stream); stream = NULL;
+        uint32_t wait = 2000u << s_fails;
+        s_retry_at = tick_ms() + wait;
+        char n[160]; net_describe(n, sizeof n);
+        LOG("stream: range failed (%s, HTTP %d), %.0f s still buffered; again in %u s; %s", why, http, (double)ahead_s, (unsigned)wait / 1000, n);
+        return;
+    }
+    stream_lost(why, http);
+}
+
+/* the range is all here: close it, so other requests can have the network */
+static void range_done(void) {
+    int64_t t = hs_total(stream);
+    if (t > 0) s_total = t;
+    int short_body = s_next - s_req_from < s_req_len;
+    snprintf(s_url, sizeof s_url, "%s", hs_url(stream));   /* where the redirects ended */
+    hs_close(stream); stream = NULL;
+    s_fails = 0;
+    if (short_body || (s_total > 0 && s_next >= s_total)) s_eof = 1;
+}
+
 static void pump_stream(float budget_s) {
-    /* network -> decoder input */
-    if (stream && dec) {
+    if (!dec) return;
+    /* network -> stream buffer: everything that has arrived */
+    fetch_next();
+    if (stream) {
         hs_poll(stream);
         int s = hs_state(stream);
-        if (s == HS_FAIL) {
-            int st = hs_status(stream);
-            if (st == 403 || st == 404 || st == 410) cache_drop(ep_url);   /* stale signed link */
-            stream_lost(hs_error(stream), st);
-            return;
-        }
+        if (s == HS_FAIL) { range_failed(hs_error(stream), hs_status(stream)); return; }
         if (s == HS_BODY || s == HS_DONE) {
-            if (hs_status(stream) == 416) { stop_stream(); sub = S_GAP; return; }   /* file shorter than scheduled */
-            if (hs_status(stream) >= 400) {
-                int st = hs_status(stream);
+            int st = hs_status(stream);
+            if (st == 416) {                             /* asked past the end */
+                hs_close(stream); stream = NULL; s_eof = 1;
+                if (sub == S_CONNECT) { stop_stream(); sub = S_GAP; return; }   /* file shorter than scheduled */
+            } else if (st >= 400 && s_len > 0 && strcmp(s_url, ep_url) && (st == 401 || st == 403 || st == 404 || st == 410)) {
+                /* a signed link expired (SoundCloud's last a few minutes):
+                 * follow the episode's own link again for a fresh one */
+                LOG("stream: link refused (HTTP %d); following the episode's link again", st);
+                cache_drop(ep_url);
+                hs_close(stream); stream = NULL;
+                snprintf(s_url, sizeof s_url, "%s", ep_url);
+                return;
+            } else if (st >= 400) {
+                LOG("stream: server said %d", st);
                 cache_drop(ep_url);
                 char m[48]; snprintf(m, sizeof m, "Show's server said %d", st);
                 trouble(m, 3000);
                 return;
+            } else if (s_total > 0 && hs_total(stream) > 0 && hs_total(stream) != s_total) {
+                /* a new link led to a different file (ads stitched in): start over at live */
+                cache_drop(ep_url);
+                stream_lost("file changed size", st);
+                return;
+            } else if (hs_range_start(stream) != s_req_from) {
+                /* the server ignored the range: these bytes aren't the ones we need */
+                char m[48]; snprintf(m, sizeof m, "server sent bytes from %lld", (long long)hs_range_start(stream));
+                cache_drop(ep_url);
+                stream_lost(m, st);
+                return;
             }
-            for (int guard = 0; guard < 16; guard++) {
-                int room = dec_space(dec);
-                if (room < 1024) break;
-                int n = hs_read(stream, netbuf, room < (int)sizeof netbuf ? room : (int)sizeof netbuf);
+        }
+        if (stream && (s == HS_BODY || s == HS_DONE)) {
+            for (int guard = 0; guard < 32; guard++) {
+                int room = s_cap - s_len;
+                if (room <= 0) break;
+                int tail = (s_head + s_len) % s_cap;
+                int n = hs_read(stream, sbuf + tail, s_cap - tail < room ? s_cap - tail : room);
                 if (n > 0) {
                     if (sub == S_CONNECT) {
                         uint32_t t = hs_ttfb_ms(stream);
@@ -546,16 +666,26 @@ static void pump_stream(float budget_s) {
                         if (ttfb_avg > 4000) ttfb_avg = 4000;
                         sub = S_ALIGN;
                     }
-                    dec_push(dec, netbuf, n);
+                    s_len += n; s_next += n;
                     continue;
                 }
-                if (n == -1) { dec_end_input(dec); break; }
-                if (n == -2) { stream_lost(hs_error(stream), hs_status(stream)); return; }
+                if (n == -1) { range_done(); break; }
+                if (n == -2) { range_failed(hs_error(stream), hs_status(stream)); return; }
                 break;
             }
         }
     }
-    if (!dec) return;
+    /* stream buffer -> decoder input */
+    while (s_len > 0) {
+        int room = dec_space(dec);
+        if (room < 1024) break;
+        int run = s_cap - s_head < s_len ? s_cap - s_head : s_len;
+        if (run > room) run = room;
+        dec_push(dec, sbuf + s_head, run);
+        s_head = (s_head + run) % s_cap;
+        s_len -= run;
+    }
+    if (s_eof && !s_len && !stream && !s_fed_eof) { dec_end_input(dec); s_fed_eof = 1; }
 
     /* decoder -> ring, inside the frame's CPU budget */
     int64_t live_off = wall_ms() - slot_start_ms;

@@ -137,15 +137,18 @@ static uint32_t ap_since, ap_shot_at;
 static int ap_shot, ap_steps, ap_done;
 static uint32_t app_start;
 static int ap_radio_only;
-/* "radio:<station>[,hold=<minutes>][,slow=<factor>]": plays that station for
- * 40 s (or the given minutes), with decoding made <factor> times slower to
- * act like a slower Playdate (player_debug_slow_decode). */
+/* "radio:<station>[,hold=<minutes>][,slow=<factor>][,expire]": plays that
+ * station for 40 s (or the given minutes), with decoding made <factor> times
+ * slower to act like a slower Playdate (player_debug_slow_decode); ",expire"
+ * breaks the stream's link before its next range, like an expired signature. */
 static uint32_t ap_hold_ms = 40000;
-/* "retune:<station>[,slow|,hang]": the rapid-retune test from issue #1. Waits
- * for sound, then steps to the next station every 2 s, 20 times, then holds
- * the last one for 3 minutes. ",slow" makes every open answer after 6 s (like
- * a device); ",hang" also makes the 5th open never answer; ",outage" skips
- * the retunes, drops the stream after 400 KB and fails every open for 150 s. */
+/* "retune:<station>[,slow|,hang|,outage|,wedge]": the rapid-retune test from
+ * issue #1. Waits for sound, then steps to the next station every 2 s, 20
+ * times, then holds the last one for 3 minutes. ",slow" makes every open
+ * answer after 6 s (like a device); ",hang" also makes the 5th open never
+ * answer; ",outage" skips the retunes, drops the stream after 400 KB and fails
+ * every open for 150 s; ",wedge" is the same, except that opens fail after
+ * 20 s (Gareth's 0.1.4 log) until Static notices and asks for Wi-Fi again. */
 static int ap_retune, ap_rt_phase, ap_rt_steps, ap_rt_long;
 static uint32_t ap_rt_at;
 /* "seam:<station>": the dial's loop. Starting on the last station, cranks
@@ -850,8 +853,8 @@ static int update(void *ud) {
         if (perf_at) app_fps = perf_frames * 1000.0f / ms;
         char nd[160]; net_describe(nd, sizeof nd);
         float load = player_decode_load();
-        if (perf_at) LOG("perf: %.1f fps, network %.0f KB/s, buffer %d ms, player %d, decoding %.0f%%%s, slowest frame %u ms; %s",
-                         perf_frames * 1000.0 / ms, (b - perf_bytes) / 1.024 / ms, audio_buffered() * 1000 / RATE, player_state(),
+        if (perf_at) LOG("perf: %.1f fps, network %.0f KB/s, buffer %d ms + %.0f s, player %d, decoding %.0f%%%s, slowest frame %u ms; %s",
+                         perf_frames * 1000.0 / ms, (b - perf_bytes) / 1.024 / ms, audio_buffered() * 1000 / RATE, (double)player_ahead_s(), player_state(),
                          load < 0 ? 0.0 : (double)(load * 100), player_lite() ? " (lite)" : "", (unsigned)frame_max_ms, nd);
         frame_max_ms = 0;
         perf_at = tick_ms(); perf_frames = 0; perf_bytes = b;
@@ -998,6 +1001,7 @@ int eventHandler(PlaydateAPI *playdate, PDSystemEvent event, uint32_t arg) {
             for (char *tok = opt ? strtok(opt, ",") : NULL; tok; tok = strtok(NULL, ",")) {
                 if (!strncmp(tok, "hold=", 5)) ap_hold_ms = (uint32_t)atoi(tok + 5) * 60000;
                 else if (!strncmp(tok, "slow=", 5)) { player_debug_slow_decode((float)atof(tok + 5)); LOG("player: decoding %s times slower (test)", tok + 5); }
+                else if (!strcmp(tok, "expire")) player_debug_spoil_link();
             }
         } else if (ap && !strncmp(ap, "seam:", 5)) {
             ap_radio_only = ap_seam = 1;
@@ -1012,6 +1016,7 @@ int eventHandler(PlaydateAPI *playdate, PDSystemEvent event, uint32_t arg) {
             if (opt && !strcmp(opt, "slow")) net_debug(6000, 0);
             if (opt && !strcmp(opt, "hang")) net_debug(6000, 5);
             if (opt && !strcmp(opt, "outage")) { net_debug(6000, 0); net_debug_outage(400 * 1024, 150000); ap_rt_steps = 20; ap_rt_long = 1; }
+            if (opt && !strcmp(opt, "wedge")) { net_debug(6000, 0); net_debug_wedge(400 * 1024); ap_rt_steps = 20; ap_rt_long = 1; }
         }
         free(ap);
         if (autopilot) { LOG("autopilot on"); audio_test_silent(1); }

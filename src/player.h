@@ -19,8 +19,11 @@ int64_t player_drift_ms(void);              /* playback minus live (+ ahead) */
 uint32_t player_playing_since(void);        /* tick_ms when sound last started */
 int player_lite(void);                      /* this stream plays in lite mode (dec_set_lite) */
 float player_decode_load(void);             /* this stream's decode time over its audio time, -1 if not yet known */
+float player_ahead_s(void);                 /* audio fetched but not yet decoded, in seconds (estimated) */
 /* Simulator tests: make decoding take this many times longer, like a slower CPU. */
 void player_debug_slow_decode(float factor);
+/* Simulator tests: break the stream's link before its next range, as when a signed link expires. */
+void player_debug_spoil_link(void);
 
 /* Lifetime stats for the report. Formats: 0 MP3, 1 AAC-LC, 2 HE-AAC, 3 WAV. */
 typedef struct {

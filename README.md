@@ -131,8 +131,10 @@ make dist       # Static-<version>.pdx.zip for sideloading
 
 Source map: `src/net.c` is HTTP/1.1 over the SDK's TLS sockets (the SDK's own
 HTTP layer follows redirects in the background and mixes up connections, so
-we don't use it), `src/player.c` tunes and keeps sync, `src/dec.c` wraps the
-decoders, `src/bench.c` is the test and `src/report.c` the reports.
+we don't use it) and keeps one connection open at a time, `src/player.c`
+tunes, fetches each episode in ranges of about 40 s and keeps sync,
+`src/dec.c` wraps the decoders, `src/bench.c` is the test and `src/report.c`
+the reports.
 
 ## Thanks
 
