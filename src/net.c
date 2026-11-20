@@ -9,10 +9,13 @@
 #define STALL_MS 12000
 #define READ_TIMEOUT_MS 3000          /* we only read what's available; never let read() wait long */
 #define WAIT_N 24
-#define QUEUE_WAIT_MS 30000           /* a request that can't start in this long fails */
+#define QUEUE_WAIT_MS 60000           /* a request that can't start in this long fails */
 #define FLIGHT_N 8
 #define OPEN_LOST_MS 45000            /* an open with no answer in this long stops holding the line */
 #define SLOW_CALL_MS 200
+#define WEDGE_FAILS 2                 /* opens failing in a row, from different hosts: the network is wedged */
+#define WEDGE_RX_MS 5000              /* unless bytes arrived this recently */
+#define NUDGE_GAP_MS 60000            /* at least this long between Wi-Fi nudges */
 
 static const struct playdate_tcp *tcp;
 /* tcp->open queues on one network thread and each connect blocks it, so an open
@@ -22,11 +25,22 @@ static const struct playdate_tcp *tcp;
  * we're done with waits here: for its own open to call back, then it's closed,
  * and it's released only after a rest with no open in flight anywhere.
  *
- * And only one open goes to the system at a time. On a device, opens piled up
- * behind one that never answered (a reconnect every 18 s, then a tune every
- * 2 s), and the next network call stalled the run loop past the 10 s watchdog.
- * So requests wait in our own queue (waitq), best priority first, where a
- * retune can drop them for free; closes wait until no open is in flight. */
+ * And only one connection exists at a time: a request goes to the system only
+ * when no other socket is open, not just when no other open is in flight. On
+ * a device (Gareth's logs, 0.1.0 to 0.1.4), opening a connection while another
+ * was downloading broke the Playdate's network: the downloading one dropped,
+ * and from then on every open failed with NET_CONNECTION_FAILED (-21) after
+ * 20 s, until Wi-Fi was turned off and on. Connections one after another, as
+ * in the test, never did that. So requests wait in our own queue (waitq), best
+ * priority first, where a retune can drop them for free, and each caller
+ * finishes or closes its connection promptly (the radio fetches the episode
+ * in ranges, see player.c). Closes wait until no open is in flight.
+ *
+ * If the network wedges anyway (opens to different hosts fail in a row and
+ * nothing arrives), we log the Wi-Fi status and ask for Wi-Fi again. We don't
+ * turn it off and on: in the Simulator, setEnabled(true) after
+ * setEnabled(false) never comes back until the app is relaunched, while
+ * setEnabled(true) on a connected Playdate just answers at once. */
 enum { G_OPENING, G_CLOSE, G_CLOSED };
 static struct { TCPConnection *c; uint32_t at; int st; } grave[GRAVE_N];
 static int ngrave, nopen;
@@ -58,6 +72,11 @@ struct hs {
 
 static hs_t *waitq[WAIT_N];
 static int nwait;
+
+/* Wedge watch: opens failing in a row, and how many hosts they were for */
+static int fails_row, fail_hosts, wedged, nudges;
+static uint32_t last_rx, nudge_at;
+static char fail_host[48];
 
 /* Time the system calls: a log line names any that blocked the run loop. */
 static uint32_t call_t0;
@@ -98,6 +117,8 @@ static int dbg_nq;
 static TCPConnection *dbg_hung;
 static int64_t dbg_cut_bytes; static int dbg_outage_ms, dbg_cut_done;
 static uint32_t dbg_outage_until;
+static int dbg_wedge, dbg_wedged;   /* test: after the cut, every open fails at 20 s until Wi-Fi is asked for again */
+static int64_t dbg_high_got;        /* bytes the tuned station has read, over all its requests */
 void net_debug(int open_delay_ms, int hang_nth) {
     dbg_delay_ms = open_delay_ms; dbg_hang_nth = hang_nth;
     LOG("net: test mode, opens answer after %d ms%s", open_delay_ms, hang_nth ? ", one never answers" : "");
@@ -105,6 +126,11 @@ void net_debug(int open_delay_ms, int hang_nth) {
 void net_debug_outage(int64_t cut_after_bytes, int outage_ms) {
     dbg_cut_bytes = cut_after_bytes; dbg_outage_ms = outage_ms;
     LOG("net: test mode, the stream drops after %lld KB, then every open fails for %d s", (long long)(cut_after_bytes / 1024), outage_ms / 1000);
+}
+
+void net_debug_wedge(int64_t cut_after_bytes) {
+    dbg_cut_bytes = cut_after_bytes; dbg_wedge = 1;
+    LOG("net: test mode, the stream drops after %lld KB, then every open fails after 20 s until Wi-Fi is asked for again", (long long)(cut_after_bytes / 1024));
 }
 
 void net_init(void) { tcp = pd->network->tcp; }
@@ -161,6 +187,38 @@ static void submit(hs_t *h) {
     }
 }
 
+/* An open's answer: a run of failures from different hosts means the network
+ * itself is wedged, not one show's server. */
+static void note_open(const char *host, PDNetErr err) {
+    if (err == NET_OK) {
+        if (wedged) LOG("net: an open worked again after %d failed in a row", fails_row);
+        fails_row = fail_hosts = wedged = 0; fail_host[0] = 0;
+        return;
+    }
+    if (err == NET_BUSY) return;
+    if (strcmp(host, fail_host)) { fail_hosts++; snprintf(fail_host, sizeof fail_host, "%s", host); }
+    fails_row++;
+}
+
+static void on_wifi_nudge(PDNetErr err) {
+    LOG("net: Wi-Fi answered: error %d, status %d, after %u ms", err, pd->network->getStatus(), (unsigned)(tick_ms() - nudge_at));
+}
+
+/* Opens to different hosts keep failing and nothing arrives: say so in the
+ * log with the Wi-Fi status, and ask for Wi-Fi again (a no-op when it's up). */
+static void wedge_tick(uint32_t now) {
+    if (fails_row < WEDGE_FAILS || fail_hosts < 2) return;
+    if (now - last_rx < WEDGE_RX_MS) { fails_row = fail_hosts = 0; return; }   /* data is flowing */
+    if (!wedged) { wedged = 1; dbg_wedged = 0; }
+    else if (nudge_at && now - nudge_at < NUDGE_GAP_MS) return;
+    nudges++;
+    nudge_at = now;
+    LOG("net: %d opens failed in a row (last %s); Wi-Fi status %d, asking for Wi-Fi again", fails_row, fail_host, pd->network->getStatus());
+    pd->network->setEnabled(true, on_wifi_nudge);
+}
+
+int net_wedged(void) { return wedged; }
+
 void net_tick(void) {
     uint32_t now = tick_ms();
     for (int i = 0; i < dbg_nq; ) {
@@ -173,6 +231,7 @@ void net_tick(void) {
     for (int i = 0; i < nfl; i++)
         if (!fl[i].lost && now - fl[i].at > OPEN_LOST_MS) {
             fl[i].lost = 1; nlost_total++;
+            note_open(fl[i].host, (PDNetErr)-21);
             LOG("net: no answer from %s in %u s; not waiting on it any more", fl[i].host, (unsigned)(now - fl[i].at) / 1000);
         }
     int active = active_opens();
@@ -183,8 +242,9 @@ void net_tick(void) {
         else grave[k++] = grave[i];
     }
     ngrave = k;
-    /* one open at a time: the best waiting request, oldest first */
-    if (!active && nwait && nfl < FLIGHT_N) {
+    wedge_tick(now);
+    /* one connection at a time: the best waiting request, oldest first */
+    if (!active && !nopen && nwait && nfl < FLIGHT_N) {
         int best = 0;
         for (int i = 1; i < nwait; i++) if (waitq[i]->prio > waitq[best]->prio) best = i;
         submit(waitq[best]);
@@ -194,8 +254,12 @@ void net_tick(void) {
 int net_stuck(void) { return nfl - active_opens(); }
 
 void net_describe(char *buf, int cap) {
-    snprintf(buf, (size_t)cap, "sockets %d, connecting %d, stuck %d (%d so far), queued %d, closing %d",
-             nopen, active_opens(), net_stuck(), nlost_total, nwait, ngrave);
+    snprintf(buf, (size_t)cap, "sockets %d, connecting %d, stuck %d (%d so far), queued %d, closing %d%s",
+             nopen, active_opens(), net_stuck(), nlost_total, nwait, ngrave, wedged ? ", wedged" : "");
+    if (nudges) {
+        size_t l = strlen(buf);
+        snprintf(buf + l, (size_t)cap - l, ", Wi-Fi asked %d", nudges);
+    }
 }
 
 static int parse_url(const char *url, char *host, size_t hcap, int *port, int *ssl, const char **path) {
@@ -257,12 +321,14 @@ static void fail(hs_t *h, const char *why) {
 
 static void deliver_open(TCPConnection *c, PDNetErr err) {
     if (dbg_outage_until && (int32_t)(tick_ms() - dbg_outage_until) < 0) err = (PDNetErr)-21;   /* test: connection failed */
+    if (dbg_wedged) err = (PDNetErr)-21;
     int k = flight_find(c);
     uint32_t took = 0; int was_lost = 0; char host[48] = "?";
     if (k >= 0) {
         took = tick_ms() - fl[k].at; was_lost = fl[k].lost;
         snprintf(host, sizeof host, "%s", fl[k].host);
         fl[k] = fl[--nfl];
+        if (!was_lost) note_open(host, err);
     }
     hs_t *h = tcp->getUserdata(c);
     if (h) {
@@ -280,10 +346,10 @@ static void deliver_open(TCPConnection *c, PDNetErr err) {
 static void on_open(TCPConnection *c, PDNetErr err, void *ud) {
     (void)ud;                            /* the hs_t may be long gone: the userdata is cleared when it goes */
     if (c == dbg_hung) return;           /* test hook: this one never answers */
-    if (dbg_delay_ms && dbg_nq < FLIGHT_N) {
+    if ((dbg_delay_ms || dbg_wedged) && dbg_nq < FLIGHT_N) {
         int k = flight_find(c);
         uint32_t at = k >= 0 ? fl[k].at : tick_ms();
-        dbg_q[dbg_nq].c = c; dbg_q[dbg_nq].err = err; dbg_q[dbg_nq].due = at + (uint32_t)dbg_delay_ms;
+        dbg_q[dbg_nq].c = c; dbg_q[dbg_nq].err = err; dbg_q[dbg_nq].due = at + (uint32_t)(dbg_wedged ? 20000 : dbg_delay_ms);
         dbg_nq++;
         return;
     }
@@ -442,7 +508,7 @@ void hs_poll(hs_t *h) {
             if (n < 0) { char m[32]; snprintf(m, sizeof m, "read err %d", n); fail(h, m); return; }
             if (n == 0) return;
             bytes_total += n;
-            h->t_last = tick_ms();
+            last_rx = h->t_last = tick_ms();
             h->hdr_len += n; h->hdr[h->hdr_len] = 0;
             char *e = strstr(h->hdr, "\r\n\r\n");
             if (e) got_headers(h, (int)(e - h->hdr) + 4);
@@ -468,6 +534,7 @@ static int refill(hs_t *h) {
     if (n < 0) { snprintf(h->err, sizeof h->err, "read err %d", n); return -2; }
     if (n == 0) return 0;
     bytes_total += n;
+    last_rx = tick_ms();
     h->pend_len = n;
     h->t_last = tick_ms();
     return 1;
@@ -521,9 +588,11 @@ int hs_read(hs_t *h, void *buf, int cap) {
             h->cl_len = 0;
         } else if (h->cl_len < (int)sizeof h->cl - 1) h->cl[h->cl_len++] = c;
     }
-    if (dbg_cut_bytes && !dbg_cut_done && h->prio == NET_PRIO_HIGH && h->got > dbg_cut_bytes) {
-        dbg_cut_done = 1; dbg_outage_until = tick_ms() + (uint32_t)dbg_outage_ms;
-        LOG("net: test: dropping the stream now");
+    if (dbg_cut_bytes && !dbg_cut_done && h->prio == NET_PRIO_HIGH && (dbg_high_got += put) > dbg_cut_bytes) {
+        dbg_cut_done = 1;
+        if (dbg_wedge) dbg_wedged = 1;
+        else dbg_outage_until = tick_ms() + (uint32_t)dbg_outage_ms;
+        LOG("net: test: dropping the stream now%s", dbg_wedge ? ", the network is wedged until Wi-Fi is asked for again" : "");
         fail(h, "test drop"); return put ? put : -2;
     }
     if (h->st == HS_BODY && put == 0 && h->c && tick_ms() - h->t_last > STALL_MS) { fail(h, "stalled"); return -2; }

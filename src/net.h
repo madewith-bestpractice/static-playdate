@@ -13,8 +13,10 @@ typedef struct hs hs_t;
 
 enum { HS_CONNECT, HS_SEND, HS_HEAD, HS_BODY, HS_DONE, HS_FAIL };
 
-/* Only one open goes to the system at a time; waiting requests start best
- * priority first (then oldest). The tuned station is HIGH, warming LOW. */
+/* Only one connection is open at a time (two at once wedged the Playdate's
+ * network), so callers finish or close theirs promptly. Waiting requests
+ * start best priority first (then oldest). The tuned station is HIGH,
+ * warming LOW. */
 enum { NET_PRIO_LOW, NET_PRIO_NORMAL, NET_PRIO_HIGH };
 
 /* from < 0: no Range header. to < 0: open-ended range. body may be NULL. */
@@ -58,6 +60,9 @@ void fetch_free(fetch_t *f);
 void net_tick(void);
 /* Opens the system never answered (the network looks stuck). */
 int net_stuck(void);
+/* Opens to different hosts keep failing and nothing arrives: the Playdate's
+ * network looks wedged (cleared by the next open that works). */
+int net_wedged(void);
 /* One line for the log: sockets, opens in flight, queued, closing. */
 void net_describe(char *buf, int cap);
 /* Simulator tests: opens answer after delay_ms; the hang_nth-th never does. */
@@ -65,6 +70,10 @@ void net_debug(int open_delay_ms, int hang_nth);
 /* Simulator tests: the tuned stream drops after cut_after_bytes, then every
  * open fails for outage_ms. */
 void net_debug_outage(int64_t cut_after_bytes, int outage_ms);
+/* Simulator tests: the tuned stream drops after cut_after_bytes, then every
+ * open fails after 20 s (as on Gareth's Playdate) until the wedge is noticed
+ * and Wi-Fi is asked for again. */
+void net_debug_wedge(int64_t cut_after_bytes);
 void net_init(void);
 int net_open_count(void);
 /* Bytes received over all sockets since start (for throughput stats). */
