@@ -13,11 +13,13 @@ also listen in your browser and get the phone apps.
 it runs on real hardware. The app starts with a two-minute test that measures
 exactly that and, if you agree, sends us the numbers. Then the radio unlocks.
 
-0.1.4 makes heavier shows playable: MP3 decodes with about a quarter less work,
-and a show that's still too heavy switches to a lighter "lite" mode instead of
-stopping at "Too heavy for the Playdate". The dial also loops: past the last
-station comes the first. We still don't own a Playdate, so we've only checked
-this in the Simulator, and reports from real Playdates are very welcome. See
+0.1.5 is about the network. On a real Playdate, 0.1.4 lost its connection each
+time a second one opened next to a download, and then almost nothing played.
+Static now keeps one connection open at a time: it downloads a show about 40
+seconds at a time, closes the connection in between, and asks the Playdate for
+Wi-Fi again if the network gets stuck. We still don't own a Playdate, so we've
+only checked this in the Simulator, and reports from real Playdates are very
+welcome. See
 [issue #1](https://github.com/madewith-bestpractice/static-playdate/issues/1).
 
 ## Install
