@@ -16,6 +16,7 @@
 #define WEDGE_FAILS 2                 /* opens failing in a row, from different hosts: the network is wedged */
 #define WEDGE_RX_MS 5000              /* unless bytes arrived this recently */
 #define NUDGE_GAP_MS 60000            /* at least this long between Wi-Fi nudges */
+#define KEEP_MS 15000                 /* a finished connection waits this long for the next request to its server */
 
 static const struct playdate_tcp *tcp;
 /* tcp->open queues on one network thread and each connect blocks it, so an open
@@ -67,11 +68,20 @@ struct hs {
     uint32_t t_start, t_hop, t_first, t_last, t_queued;
     char host[256]; int port, ssl;
     int prio, waiting, connect_ms;
+    int keep, reused;                 /* the server keeps the connection open; this request is on a kept one */
     char err[64];
 };
 
 static hs_t *waitq[WAIT_N];
 static int nwait;
+
+/* The last finished connection, kept open for another request to the same
+ * server. Opening a connection takes 5-8 s on a Playdate, and tuning asks one
+ * server several times in a row (the file's start, then its ranges). It is
+ * still the only connection: it's closed as soon as a request for any other
+ * server is waiting, or after KEEP_MS. */
+static struct { TCPConnection *c; char host[256]; int port, ssl; uint32_t at; int closed; } kept;
+static int nreused;
 
 /* Wedge watch: opens failing in a row, and how many hosts they were for */
 static int fails_row, fail_hosts, wedged, nudges;
@@ -171,6 +181,12 @@ static void bury(TCPConnection *c, int open_pending) {
     ngrave++;
 }
 
+static void drop_kept(void) {
+    if (!kept.c) return;
+    bury(kept.c, 0);
+    kept.c = NULL;
+}
+
 static void fail(hs_t *h, const char *why);
 static void deliver_open(TCPConnection *c, PDNetErr err);
 static void on_open(TCPConnection *c, PDNetErr err, void *ud);
@@ -252,6 +268,20 @@ void net_tick(void) {
             note_open(fl[i].host, (PDNetErr)-21);
             LOG("net: no answer from %s in %u s; not waiting on it any more", fl[i].host, (unsigned)(now - fl[i].at) / 1000);
         }
+    int best = -1;
+    for (int i = 0; i < nwait; i++) if (best < 0 || waitq[i]->prio > waitq[best]->prio) best = i;
+    if (kept.c) {
+        hs_t *h = best >= 0 ? waitq[best] : NULL;
+        if (h && !kept.closed && h->port == kept.port && h->ssl == kept.ssl && !strcmp(h->host, kept.host)) {
+            unqueue(h);
+            h->c = kept.c; kept.c = NULL;
+            tcp->setUserdata(h->c, h);
+            h->opened = 1; h->open_err = NET_OK; h->reused = 1;
+            h->t_hop = tick_ms();
+            nreused++;
+            best = -1;
+        } else if (h || kept.closed || now - kept.at > KEEP_MS) drop_kept();
+    }
     int active = active_opens();
     int k = 0;
     for (int i = 0; i < ngrave; i++) {
@@ -262,18 +292,14 @@ void net_tick(void) {
     ngrave = k;
     wedge_tick(now);
     /* one connection at a time: the best waiting request, oldest first */
-    if (!active && !nopen && nwait && nfl < FLIGHT_N) {
-        int best = 0;
-        for (int i = 1; i < nwait; i++) if (waitq[i]->prio > waitq[best]->prio) best = i;
-        submit(waitq[best]);
-    }
+    if (best >= 0 && !active && !nopen && nfl < FLIGHT_N) submit(waitq[best]);
 }
 
 int net_stuck(void) { return nfl - active_opens(); }
 
 void net_describe(char *buf, int cap) {
-    snprintf(buf, (size_t)cap, "sockets %d, connecting %d, stuck %d (%d so far), queued %d, closing %d%s",
-             nopen, active_opens(), net_stuck(), nlost_total, nwait, ngrave, wedged ? ", wedged" : "");
+    snprintf(buf, (size_t)cap, "sockets %d, connecting %d, stuck %d (%d so far), queued %d, closing %d, reused %d%s%s",
+             nopen, active_opens(), net_stuck(), nlost_total, nwait, ngrave, nreused, kept.c ? ", one kept" : "", wedged ? ", wedged" : "");
     if (nudges) {
         size_t l = strlen(buf);
         snprintf(buf + l, (size_t)cap - l, ", Wi-Fi asked %d", nudges);
@@ -329,8 +355,17 @@ int hs_header(const hs_t *h, const char *name, char *v, int cap) {
     return 0;
 }
 
+static int connect_hop(hs_t *h);
 static void fail(hs_t *h, const char *why) {
     if (h->st == HS_FAIL) return;
+    if (h->reused && !h->hdr_len && (h->closed || h->st == HS_SEND || !strcmp(h->method, "GET"))) {
+        /* the server had closed the kept connection: ask again on a new one
+         * (only a GET if it might have arrived: a GET is safe to repeat) */
+        bury(h->c, 0); h->c = NULL;
+        h->reused = 0;
+        connect_hop(h);
+        return;
+    }
     snprintf(h->err, sizeof h->err, "%s", why);
     unqueue(h);
     bury(h->c, !h->opened); h->c = NULL;
@@ -375,6 +410,7 @@ static void on_open(TCPConnection *c, PDNetErr err, void *ud) {
 }
 static void on_closed(TCPConnection *c, PDNetErr err) {
     (void)err;
+    if (c == kept.c) kept.closed = 1;
     hs_t *h = tcp->getUserdata(c);
     if (h && h->c == c) h->closed = 1;
 }
@@ -384,7 +420,7 @@ static int connect_hop(hs_t *h) {
     const char *path;
     if (parse_url(h->url, h->host, sizeof h->host, &h->port, &h->ssl, &path)) { fail(h, "bad url"); return -1; }
     h->c = NULL;
-    h->opened = h->open_err = h->closed = 0;
+    h->opened = h->open_err = h->closed = h->keep = 0;
     h->status = 0; h->chunked = 0; h->clen = -1;
     h->hdr_len = 0; h->hdr[0] = 0; h->req_off = 0;
     h->pend_len = h->pend_off = 0;
@@ -400,7 +436,7 @@ static int connect_hop(hs_t *h) {
     if (pl > 4096) pl = 4096;
     h->req_len = snprintf(h->req, sizeof h->req,
         "%s %.*s HTTP/1.1\r\nHost: %s\r\nUser-Agent: " USER_AGENT "\r\n"
-        "Accept: */*\r\nAccept-Encoding: identity\r\n%s%sConnection: close\r\n\r\n",
+        "Accept: */*\r\nAccept-Encoding: identity\r\n%s%s\r\n",
         h->method, pl, path, h->host, range, extra);
     if (h->req_len >= (int)sizeof h->req) { fail(h, "request too long"); return -1; }
     if (nwait == WAIT_N) { fail(h, "too many requests"); return -1; }
@@ -432,10 +468,22 @@ hs_t *hs_open(const char *url, const char *method, int64_t from, int64_t to,
 
 void hs_set_priority(hs_t *h, int prio) { if (h) h->prio = prio; }
 
+/* The whole response is read and the server will take another request on it. */
+static int reusable(const hs_t *h) {
+    return h->c && h->keep && !h->closed && h->st == HS_DONE && !h->chunked
+        && h->clen >= 0 && h->got == h->clen && h->pend_off >= h->pend_len && !kept.c;
+}
+
 void hs_close(hs_t *h) {
     if (!h) return;
     unqueue(h);
-    bury(h->c, !h->opened);
+    if (reusable(h)) {
+        tcp->setUserdata(h->c, NULL);
+        kept.c = h->c;
+        snprintf(kept.host, sizeof kept.host, "%s", h->host);
+        kept.port = h->port; kept.ssl = h->ssl;
+        kept.at = tick_ms(); kept.closed = 0;
+    } else bury(h->c, !h->opened);
     free(h->body);
     free(h);
 }
@@ -443,6 +491,7 @@ void hs_close(hs_t *h) {
 static void got_headers(hs_t *h, int hend) {
     sscanf(h->hdr, "HTTP/%*s %d", &h->status);
     static char v[4096];
+    h->keep = !strncmp(h->hdr, "HTTP/1.1", 8) && !(hs_header(h, "Connection", v, sizeof v) && !strncasecmp(v, "close", 5));
     if (hs_header(h, "Content-Length", v, sizeof v)) h->clen = atoll(v);
     if (hs_header(h, "Transfer-Encoding", v, sizeof v) && strstr(v, "chunked")) { h->chunked = 1; h->clen = -1; }
     if (h->status >= 300 && h->status < 400 && h->status != 304 && hs_header(h, "Location", v, sizeof v)) {
