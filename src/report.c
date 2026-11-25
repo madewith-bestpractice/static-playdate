@@ -11,6 +11,7 @@
 #define RTDB "https://static-3c8b6-default-rtdb.firebaseio.com"
 #define COUNTS_URL "https://staticradio.app/api/counts"
 #define HEARTBEAT_MS 30000
+#define HUNGRY_HEARTBEAT_MS 55000     /* while the stream is short of audio: still inside the 75 s */
 #define COUNTS_MS 60000
 #define QN 8
 
@@ -179,13 +180,17 @@ void report_update(void) {
         snprintf(presence_on, sizeof presence_on, "%s", presence_want);
         presence_at = 0;
     }
-    if (presence_on[0] && (!presence_at || tick_ms() - presence_at > HEARTBEAT_MS) && nq < QN - 2) {
+    /* Each request here costs the stream a new connection, 5-8 s on a Playdate,
+     * which a 320 kbps show can't spare: while it's short, heartbeat less
+     * often and leave the counts. */
+    int hungry = player_hungry();
+    if (presence_on[0] && (!presence_at || tick_ms() - presence_at > (hungry ? HUNGRY_HEARTBEAT_MS : HEARTBEAT_MS)) && nq < QN - 2) {
         char url[160];
         snprintf(url, sizeof url, RTDB "/presence/%s/%s.json", presence_on, device_id);
         enqueue("PUT", url, strdup("{\"ts\":{\".sv\":\"timestamp\"}}"), 0);
         presence_at = tick_ms();
     }
-    if (presence_on[0] && (!counts_at || tick_ms() - counts_at > COUNTS_MS) && nq < QN - 2) {
+    if (presence_on[0] && !hungry && (!counts_at || tick_ms() - counts_at > COUNTS_MS) && nq < QN - 2) {
         enqueue("GET", COUNTS_URL, NULL, 0);
         counts_at = tick_ms();
     }

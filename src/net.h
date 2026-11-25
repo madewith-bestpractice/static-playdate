@@ -74,6 +74,8 @@ void net_debug_outage(int64_t cut_after_bytes, int outage_ms);
  * open fails after 20 s (as on Gareth's Playdate) until the wedge is noticed
  * and Wi-Fi is asked for again. */
 void net_debug_wedge(int64_t cut_after_bytes);
+/* Simulator tests: bytes arrive no faster than kb_per_s, as on a device. */
+void net_debug_rate(int kb_per_s);
 void net_init(void);
 int net_open_count(void);
 /* Bytes received over all sockets since start (for throughput stats). */
