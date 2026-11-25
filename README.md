@@ -13,13 +13,13 @@ also listen in your browser and get the phone apps.
 it runs on real hardware. The app starts with a two-minute test that measures
 exactly that and, if you agree, sends us the numbers. Then the radio unlocks.
 
-0.1.5 is about the network. On a real Playdate, 0.1.4 lost its connection each
-time a second one opened next to a download, and then almost nothing played.
-Static now keeps one connection open at a time: it downloads a show about 40
-seconds at a time, closes the connection in between, and asks the Playdate for
-Wi-Fi again if the network gets stuck. We still don't own a Playdate, so we've
-only checked this in the Simulator, and reports from real Playdates are very
-welcome. See
+0.1.6 is about the wait before the sound starts. On a real Playdate, 0.1.5
+took about 40 seconds to tune, and a 320 kbps show kept dropping out. Static
+now keeps a connection open for the next request to the same server, skips
+ahead to the live moment instead of decoding its way there, and asks for more
+of a show sooner. In the Simulator, set to act like that Playdate, tuning
+takes about 15 seconds. We still don't own a Playdate, so reports from real
+ones are very welcome. See
 [issue #1](https://github.com/madewith-bestpractice/static-playdate/issues/1).
 
 ## Install
