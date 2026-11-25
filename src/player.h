@@ -20,6 +20,8 @@ uint32_t player_playing_since(void);        /* tick_ms when sound last started *
 int player_lite(void);                      /* this stream plays in lite mode (dec_set_lite) */
 float player_decode_load(void);             /* this stream's decode time over its audio time, -1 if not yet known */
 float player_ahead_s(void);                 /* audio fetched but not yet decoded, in seconds (estimated) */
+/* The stream is short of audio fetched ahead: other requests should wait or come less often. */
+int player_hungry(void);
 /* Simulator tests: make decoding take this many times longer, like a slower CPU. */
 void player_debug_slow_decode(float factor);
 /* Simulator tests: break the stream's link before its next range, as when a signed link expires. */

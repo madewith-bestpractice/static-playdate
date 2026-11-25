@@ -41,6 +41,8 @@
 #define SBUF_MAX (2 * 1024 * 1024)
 #define SBUF_MIN (256 * 1024)
 #define CHUNK_RETRIES 3          /* a range that fails is tried again while the buffer lasts */
+#define LOW_S 30                 /* less than this ahead: ask for the next range now, even a partial one */
+#define SKIP_MS 1500             /* further than this behind live: skip bytes instead of decoding them */
 
 /* ---------- probe cache ---------- */
 
@@ -324,6 +326,7 @@ static float s_rate;              /* bytes per second of audio (estimated) */
 static int s_eof, s_fed_eof, s_fails;
 static uint32_t s_retry_at;
 static char s_url[4096];
+static probe_t s_probe;           /* the stream's format, for seeking within it (final not kept) */
 static int fmt_class;             /* stats bucket */
 static uint32_t tune_t0;          /* click time, for time-to-sound */
 static int tune_counted;
@@ -370,6 +373,7 @@ static float stretch_decode(float t0, float dt, int n) {
 }
 int player_lite(void) { return dec && dec_is_lite(dec); }
 float player_ahead_s(void) { return dec && s_rate > 0 ? s_len / s_rate : 0; }
+int player_hungry(void) { return dec && sub == S_PLAY && !s_eof && s_len < s_rate * LOW_S; }
 float player_decode_load(void) { return dec && stream_audio_s > 1 ? stream_decode_s / stream_audio_s : -1; }
 
 void player_init(void) { memset(&stats, 0, sizeof stats); }
@@ -452,13 +456,19 @@ static float byte_rate(const probe_t *p) {
     return 24000;                                    /* 192 kbps */
 }
 
-/* Ask for the next range once a whole one fits in the buffer. */
+/* Ask for the next range once a whole one fits in the buffer, or sooner, for
+ * what fits, once less than LOW_S is left: a new connection can take 8 s on a
+ * Playdate, and a 320 kbps show only has room for about 26 s. */
 static void fetch_next(void) {
     if (stream || s_eof || (int32_t)(tick_ms() - s_retry_at) < 0) return;
     int64_t want = s_chunk;
     if (s_total > 0 && s_total - s_next < want) want = s_total - s_next;
     if (want <= 0) { s_eof = 1; return; }
-    if (s_cap - s_len < want) return;
+    int room = s_cap - s_len;
+    if (room < want) {
+        if (s_len >= s_rate * LOW_S || room < s_chunk / 4) return;
+        want = room;
+    }
     if (dbg_spoil_link && sub == S_PLAY) {           /* test: the link stops working */
         dbg_spoil_link = 0;
         char *path = strstr(s_url, "://");
@@ -471,39 +481,55 @@ static void fetch_next(void) {
     s_req_from = s_next; s_req_len = want;
 }
 
+/* Where to read from for media time `at`: the file byte, the media time that
+ * byte starts (exact for MP4, estimated for MP3), and for MP4 the sample.
+ * -1: the MP4 index isn't loaded; -2: past the end of the MP4. */
+static int locate(const probe_t *p, int64_t at, int64_t *byte, int64_t *start_ms, uint32_t *sample) {
+    *byte = 0; *start_ms = at; *sample = 0;
+    if (p->fmt == FMT_MP3) {
+        *byte = at > 500 ? mp3_byte_for_ms(&p->mp3, at) : p->mp3.audio_start;
+        if (at <= 500) *start_ms = 0;
+    } else if (p->fmt == FMT_WAV) {
+        *byte = p->wav_data + (at * p->wav_rate / 1000) * 2LL * p->wav_ch;
+    } else if (p->fmt == FMT_MP4) {
+        if (!moov_cache.ok || moov_cache.key != hash(ep_url)) return -1;
+        *sample = mp4_sample_for_ms(&moov_cache.idx, at, start_ms);
+        mp4iter_t it;
+        if (mp4_iter_seek(&moov_cache.idx, *sample, &it)) return -2;
+        *byte = (int64_t)it.off;
+    }
+    return 0;
+}
+
+static dec_t *new_decoder(int64_t byte, int64_t start_ms, uint32_t sample) {
+    const probe_t *p = &s_probe;
+    dec_t *d = dec_new(p->fmt, byte, start_ms, p->fmt == FMT_MP4 ? &moov_cache.idx : NULL, sample, p->wav_rate, p->wav_ch);
+    if (d) dec_set_gain_db(d, ep_gain);
+    return d;
+}
+
 /* open the stream for the live episode at the live offset (+ expected latency) */
 static void start_stream(const probe_t *p) {
     int64_t off;
     const ep_t *ep = live(tuned, &off, NULL);
     if (!ep) return;
-    int64_t at = off + ttfb_avg;
-    int64_t byte = 0, start_ms = at;
-    uint32_t first_sample = 0;
-    if (p->fmt == FMT_MP3) {
-        byte = at > 500 ? mp3_byte_for_ms(&p->mp3, at) : p->mp3.audio_start;
-        if (at <= 500) start_ms = 0;
-    } else if (p->fmt == FMT_WAV) {
-        int64_t fb = 2LL * p->wav_ch;
-        byte = p->wav_data + (at * p->wav_rate / 1000) * fb;
-    } else if (p->fmt == FMT_MP4) {
-        if (!moov_cache.ok || moov_cache.key != hash(ep_url)) { sub = S_IDLE; return; }   /* re-probe for the index */
-        int64_t sms = 0;
-        first_sample = mp4_sample_for_ms(&moov_cache.idx, at, &sms);
-        mp4iter_t it;
-        if (mp4_iter_seek(&moov_cache.idx, first_sample, &it)) { audio_end_ms = 0; sub = S_GAP; return; }
-        byte = (int64_t)it.off;
-        start_ms = sms;
-    }
+    int64_t byte, start_ms;
+    uint32_t first_sample;
+    int where = locate(p, off + ttfb_avg, &byte, &start_ms, &first_sample);
+    if (where == -1) { sub = S_IDLE; return; }                         /* re-probe for the MP4 index */
+    if (where == -2) { audio_end_ms = 0; sub = S_GAP; return; }
     if (p->total > 0 && byte >= p->total) { sub = S_GAP; return; }   /* past the end of the file */
-    dec = dec_new(p->fmt, byte, start_ms, p->fmt == FMT_MP4 ? &moov_cache.idx : NULL, first_sample, p->wav_rate, p->wav_ch);
+    s_probe = *p;
+    s_probe.final = NULL;
+    dec = new_decoder(byte, start_ms, first_sample);
     if (!dec) { set_status("Decoder out of memory"); sub = S_WAIT; retry_at = tick_ms() + 5000; return; }
-    dec_set_gain_db(dec, ep_gain);
     fmt_class = classify(p->fmt);
     stream_audio_s = stream_decode_s = 0;
     if (!sbuf) {                                     /* once, and kept: big blocks fragment the heap */
         sbuf_max = dbg_ring_max && dbg_ring_max < SBUF_MAX ? dbg_ring_max : SBUF_MAX;
-        for (; sbuf_max >= SBUF_MIN && !(sbuf = malloc((size_t)sbuf_max)); sbuf_max /= 2) {}
+        for (; sbuf_max >= SBUF_MIN && !(sbuf = malloc((size_t)sbuf_max)); sbuf_max -= SBUF_MIN) {}
         if (!sbuf) { dec_free(dec); dec = NULL; set_status("Out of memory"); sub = S_WAIT; retry_at = tick_ms() + 5000; return; }
+        LOG("stream buffer: %d KB", sbuf_max / 1024);
     }
     s_rate = byte_rate(p);
     s_cap = (int)fminf(s_rate * BUF_S, (float)sbuf_max);
@@ -605,7 +631,8 @@ static void range_failed(const char *why, int http) {
     stream_lost(why, http);
 }
 
-/* the range is all here: close it, so other requests can have the network */
+/* the range is all here: close it, so other requests can have the network
+ * unless the next range is due now */
 static void range_done(void) {
     int64_t t = hs_total(stream);
     if (t > 0) s_total = t;
@@ -614,6 +641,38 @@ static void range_done(void) {
     hs_close(stream); stream = NULL;
     s_fails = 0;
     if (short_body || (s_total > 0 && s_next >= s_total)) s_eof = 1;
+    fetch_next();   /* ask now, while the connection is still kept for its server */
+}
+
+/* Playback is behind live by more than SKIP_MS: a tune's first bytes arrive
+ * seconds after the range was asked for, and an underrun leaves it behind too.
+ * Skip the bytes that are already in the past instead of decoding them: on a
+ * Playdate decoding runs only a little faster than real time, so catching up
+ * that way took 20-30 s after tuning and stretched every dropout. Returns 0
+ * while the bytes for `target` are still to come. */
+static int catch_up(int64_t target) {
+    int64_t byte, start_ms;
+    uint32_t sample;
+    if (locate(&s_probe, target, &byte, &start_ms, &sample)) return 1;   /* decode the rest of the way */
+    int64_t oldest = s_next - s_len;                 /* file offset of the oldest byte in the buffer */
+    if (byte <= oldest) return 1;
+    if (byte > s_next) {                             /* not here yet: drop what we have */
+        s_head = s_len = 0;
+        if (!stream) s_next = byte;
+        return 0;
+    }
+    int drop = (int)(byte - oldest);
+    s_head = (s_head + drop) % s_cap;
+    s_len -= drop;
+    int64_t was = dec_pos_ms(dec);
+    int lite = dec_is_lite(dec);
+    dec_free(dec);
+    dec = new_decoder(byte, start_ms, sample);
+    if (!dec) { trouble("Decoder out of memory", 5000); return 0; }
+    if (lite) dec_set_lite(dec);
+    if (sub == S_PLAY) stats.resyncs++;
+    LOG("skipped %.1f s to catch up with live", (double)(start_ms - was) / 1000);
+    return 1;
 }
 
 static void pump_stream(float budget_s) {
@@ -678,7 +737,13 @@ static void pump_stream(float budget_s) {
             }
         }
     }
-    /* stream buffer -> decoder input */
+    /* stream buffer -> decoder input, skipping what's already in the past */
+    int64_t live_off = wall_ms() - slot_start_ms;
+    int64_t want_ms = -1;
+    if (sub == S_ALIGN && play_head_ms < 0) want_ms = live_off + PREROLL_MS;
+    else if (sub == S_PLAY) want_ms = live_off + audio_buffered() * 1000LL / RATE;
+    if (want_ms >= 0 && want_ms - dec_pos_ms(dec) > SKIP_MS && !catch_up(want_ms)) return;
+    if (!dec) return;
     while (s_len > 0) {
         int room = dec_space(dec);
         if (room < 1024) break;
@@ -691,10 +756,9 @@ static void pump_stream(float budget_s) {
     if (s_eof && !s_len && !stream && !s_fed_eof) { dec_end_input(dec); s_fed_eof = 1; }
 
     /* decoder -> ring, inside the frame's CPU budget */
-    int64_t live_off = wall_ms() - slot_start_ms;
     while (cpu_s() < budget_s) {
         int buffered_ms = audio_buffered() * 1000 / RATE;
-        if (sub == S_PLAY && buffered_ms >= TARGET_MS) break;
+        if ((sub == S_PLAY || play_head_ms >= 0) && buffered_ms >= TARGET_MS) break;
         if (audio_space() < 8192) break;
         int64_t chunk_ms = dec_pos_ms(dec);
         if (chunk_ms >= audio_end_ms) { stop_stream(); sub = S_GAP; break; }
@@ -769,7 +833,6 @@ static void pump_stream(float budget_s) {
     }
     if (sub == S_ALIGN && play_head_ms >= 0) {
         int64_t now_off = wall_ms() - slot_start_ms;
-        int buffered_ms = audio_buffered() * 1000 / RATE;
         if (now_off >= play_head_ms) {                   /* the clock reached the first queued sample */
             if (now_off - play_head_ms > RESYNC_MS) { audio_flush(); play_head_ms = -1; return; }   /* too late: re-align */
             sub = S_PLAY;
@@ -788,9 +851,10 @@ static void pump_stream(float budget_s) {
                 if (t > stats.tune_ms_max) stats.tune_ms_max = t;
                 LOG("first sound %u ms after tuning (fmt class %d)", (unsigned)t, fmt_class);
             }
-        } else if (buffered_ms > TARGET_MS && play_head_ms - now_off > 3000) {
-            /* far ahead of live (a stale estimate): try again from now */
-            audio_flush(); play_head_ms = -1;
+        } else if (play_head_ms - now_off > 3 * TARGET_MS) {
+            /* far ahead of live (the clock changed): start again from now */
+            stop_stream(); audio_flush(); play_head_ms = -1;
+            sub = S_IDLE;
         }
     }
 }
@@ -806,7 +870,7 @@ static void maybe_warm(void) {
         return;
     }
     if ((int32_t)(tick_ms() - warm_rest_until) < 0) return;
-    if (sub != S_PLAY || audio_buffered() < RATE * 2 || job.st != PJ_IDLE) return;
+    if (sub != S_PLAY || audio_buffered() < RATE * 2 || job.st != PJ_IDLE || player_hungry()) return;
     if (!sch || tuned < 0) return;
     int64_t now = wall_ms();
     /* next episode on this station, close to the end of this one */
