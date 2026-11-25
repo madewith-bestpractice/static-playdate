@@ -133,6 +133,24 @@ void net_debug_wedge(int64_t cut_after_bytes) {
     LOG("net: test mode, the stream drops after %lld KB, then every open fails after 20 s until Wi-Fi is asked for again", (long long)(cut_after_bytes / 1024));
 }
 
+/* Simulator tests: a byte allowance that refills at dbg_rate KB/s */
+static int dbg_rate;
+static double dbg_allow;
+static uint32_t dbg_allow_at;
+void net_debug_rate(int kb_per_s) {
+    dbg_rate = kb_per_s;
+    LOG("net: test mode, bytes arrive at %d KB/s at most", kb_per_s);
+}
+static size_t rate_cap(size_t want) {
+    if (!dbg_rate) return want;
+    uint32_t now = tick_ms();
+    double per_s = dbg_rate * 1024.0;
+    dbg_allow += (now - dbg_allow_at) * per_s / 1000;
+    dbg_allow_at = now;
+    if (dbg_allow > per_s / 4) dbg_allow = per_s / 4;
+    return dbg_allow < (double)want ? (size_t)dbg_allow : want;
+}
+
 void net_init(void) { tcp = pd->network->tcp; }
 int net_open_count(void) { return nopen; }
 int64_t net_bytes_total(void) { return bytes_total; }
@@ -495,6 +513,7 @@ void hs_poll(hs_t *h) {
         case HS_HEAD: {
             size_t avail;
             TIMED("getBytesAvailable", avail = tcp->getBytesAvailable(h->c));
+            if (avail && !(avail = rate_cap(avail))) return;
             if (!avail) {
                 if (h->closed) fail(h, "closed before headers");
                 else if (tick_ms() - h->t_last > STALL_MS) fail(h, "no response");
@@ -507,6 +526,7 @@ void hs_poll(hs_t *h) {
             if (n == NET_READ_TIMEOUT || n == NET_READ_BUSY) return;
             if (n < 0) { char m[32]; snprintf(m, sizeof m, "read err %d", n); fail(h, m); return; }
             if (n == 0) return;
+            if (dbg_rate) dbg_allow -= n;
             bytes_total += n;
             last_rx = h->t_last = tick_ms();
             h->hdr_len += n; h->hdr[h->hdr_len] = 0;
@@ -527,12 +547,14 @@ static int refill(hs_t *h) {
     h->pend_off = h->pend_len = 0;
     size_t avail;
     TIMED("getBytesAvailable", avail = tcp->getBytesAvailable(h->c));
+    if (avail && !(avail = rate_cap(avail))) return 0;
     if (!avail) return h->closed ? -1 : 0;
     int n;
     TIMED("read", n = tcp->read(h->c, h->pend, avail < sizeof h->pend ? avail : sizeof h->pend));
     if (n == NET_READ_TIMEOUT || n == NET_READ_BUSY) return 0;
     if (n < 0) { snprintf(h->err, sizeof h->err, "read err %d", n); return -2; }
     if (n == 0) return 0;
+    if (dbg_rate) dbg_allow -= n;
     bytes_total += n;
     last_rx = tick_ms();
     h->pend_len = n;

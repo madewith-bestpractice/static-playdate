@@ -137,10 +137,13 @@ static uint32_t ap_since, ap_shot_at;
 static int ap_shot, ap_steps, ap_done;
 static uint32_t app_start;
 static int ap_radio_only;
-/* "radio:<station>[,hold=<minutes>][,slow=<factor>][,expire]": plays that
- * station for 40 s (or the given minutes), with decoding made <factor> times
- * slower to act like a slower Playdate (player_debug_slow_decode); ",expire"
- * breaks the stream's link before its next range, like an expired signature. */
+/* "radio:<station>[,hold=<minutes>][,slow=<factor>][,expire][,net=<ms>][,rate=<KB/s>][,ring=<KB>]":
+ * plays that station for 40 s (or the given minutes), with decoding made
+ * <factor> times slower to act like a slower Playdate
+ * (player_debug_slow_decode); ",expire" breaks the stream's link before its
+ * next range, like an expired signature. ",net", ",rate" and ",ring" act like
+ * a device's network and memory: every open answers after <ms>, bytes arrive
+ * at <KB/s> at most, and the stream buffer gets at most <KB>. */
 static uint32_t ap_hold_ms = 40000;
 /* "retune:<station>[,slow|,hang|,outage|,wedge]": the rapid-retune test from
  * issue #1. Waits for sound, then steps to the next station every 2 s, 20
@@ -1002,6 +1005,9 @@ int eventHandler(PlaydateAPI *playdate, PDSystemEvent event, uint32_t arg) {
                 if (!strncmp(tok, "hold=", 5)) ap_hold_ms = (uint32_t)atoi(tok + 5) * 60000;
                 else if (!strncmp(tok, "slow=", 5)) { player_debug_slow_decode((float)atof(tok + 5)); LOG("player: decoding %s times slower (test)", tok + 5); }
                 else if (!strcmp(tok, "expire")) player_debug_spoil_link();
+                else if (!strncmp(tok, "net=", 4)) net_debug(atoi(tok + 4), 0);
+                else if (!strncmp(tok, "rate=", 5)) net_debug_rate(atoi(tok + 5));
+                else if (!strncmp(tok, "ring=", 5)) { player_debug_ring_kb(atoi(tok + 5)); LOG("player: stream buffer at most %s KB (test)", tok + 5); }
             }
         } else if (ap && !strncmp(ap, "seam:", 5)) {
             ap_radio_only = ap_seam = 1;

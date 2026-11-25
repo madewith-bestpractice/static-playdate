@@ -24,6 +24,8 @@ float player_ahead_s(void);                 /* audio fetched but not yet decoded
 void player_debug_slow_decode(float factor);
 /* Simulator tests: break the stream's link before its next range, as when a signed link expires. */
 void player_debug_spoil_link(void);
+/* Simulator tests: the stream buffer gets at most this many KB, as when a big block won't fit on a device. */
+void player_debug_ring_kb(int kb);
 
 /* Lifetime stats for the report. Formats: 0 MP3, 1 AAC-LC, 2 HE-AAC, 3 WAV. */
 typedef struct {

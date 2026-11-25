@@ -341,6 +341,7 @@ static int16_t pcm[8192];
 static char unsupported_why[24]; /* shown with the time to the next show; keep it short */
 static float slow_decode = 1;    /* Simulator tests: stretch decode time like a slower CPU */
 static int dbg_spoil_link;       /* Simulator tests: break the stream's link once, like an expired signature */
+static int dbg_ring_max;         /* Simulator tests: cap the stream buffer */
 
 const player_stats_t *player_stats(void) { return &stats; }
 int player_state(void) { return state; }
@@ -353,6 +354,7 @@ static void set_status(const char *s) { snprintf(status, sizeof status, "%s", s)
 
 void player_debug_slow_decode(float factor) { slow_decode = factor; }
 void player_debug_spoil_link(void) { dbg_spoil_link = 1; }
+void player_debug_ring_kb(int kb) { dbg_ring_max = kb * 1024; }
 
 /* Simulator tests: wait out slow_decode times this step's usual decode time.
  * The usual time per output sample follows drops quickly and rises slowly, so
@@ -499,7 +501,8 @@ static void start_stream(const probe_t *p) {
     fmt_class = classify(p->fmt);
     stream_audio_s = stream_decode_s = 0;
     if (!sbuf) {                                     /* once, and kept: big blocks fragment the heap */
-        for (sbuf_max = SBUF_MAX; sbuf_max >= SBUF_MIN && !(sbuf = malloc((size_t)sbuf_max)); sbuf_max /= 2) {}
+        sbuf_max = dbg_ring_max && dbg_ring_max < SBUF_MAX ? dbg_ring_max : SBUF_MAX;
+        for (; sbuf_max >= SBUF_MIN && !(sbuf = malloc((size_t)sbuf_max)); sbuf_max /= 2) {}
         if (!sbuf) { dec_free(dec); dec = NULL; set_status("Out of memory"); sub = S_WAIT; retry_at = tick_ms() + 5000; return; }
     }
     s_rate = byte_rate(p);
